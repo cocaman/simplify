@@ -1,12 +1,14 @@
 Simplify
 ========
 
+[![Build Status](https://travis-ci.org/CalebFenton/simplify.svg?branch=master)](https://travis-ci.org/CalebFenton/simplify) [![Coverage Status](https://img.shields.io/coveralls/CalebFenton/simplify.svg)](https://coveralls.io/r/CalebFenton/simplify)
+
 Generic Android Deobfuscator
 ----------------------------
 
 Simplify uses a virtual machine to understand what an app does. Then, it applies optimizations to create code that behaves identically, but is easier for a human to understand. Specifically, it takes Smali files as input and outputs a Dex file with (hopefully) identical semantics but less complicated structure.
 
-For example, if an app's strings are encrypted, Simplify will interpret the app in its own virtual machine to determine semantics. Then, it uses the apps own code to decrypt the strings and replaces the encrypted strings and the decryption method calls with the decrypted versions. It's a generic deobfuscator becuase Simplify doesn't need to know how the decryption works ahead of time. This technique also works well for eliminating different types of white noise, such as no-ops and useless arithmetic.
+For example, if an app's strings are encrypted, Simplify will interpret the app in its own virtual machine to determine semantics. Then, it uses the apps own code to decrypt the strings and replaces the encrypted strings and the decryption method calls with the decrypted versions. It's a **generic** deobfuscator because Simplify doesn't need to know how the decryption works ahead of time. This technique also works well for eliminating different types of white noise, such as no-ops and useless arithmetic.
 
 **Before / After**
 
@@ -19,7 +21,7 @@ For example, if an app's strings are encrypted, Simplify will interpret the app 
 
 There are three parts to the project:
 
-1. **Smali Virtual Machine (SmaliVM)** - A VM designed to handle ambiguous values and multiple possible execution paths. For example, if there is an `if`, and the predicate includes unknown values (user input, current time, read from a file, etc.), the VM will assume either one could happen, and takes the `true` and `false` paths. This increases uncertainty, but maintains fidelity. SmaliVM's output is a graph that represents what the app could do. It contains every possible execution path and the register and class member values at each possible execution of every instruction.
+1. **Smali Virtual Machine (SmaliVM)** - A VM designed to handle ambiguous values and multiple possible execution paths. For example, if there is an `if`, and the predicate includes unknown values (user input, current time, read from a file, etc.), the VM will assume either one could happen, and takes both the `true` and `false` paths. This increases uncertainty, but ensures fidelity. SmaliVM's output is a graph that represents what the app could do. It contains every possible execution path and the register and class member values at each possible execution of every instruction.
 2. **Simplify** - The optimizer. It takes the graphs from SmaliVM and applies optimizations like constant propagation, dead code removal, and  specific peephole optimizations.
 3. **Demoapp** - A short and heavily commented project that shows how to get started using SmaliVM.
 
@@ -27,16 +29,11 @@ There are three parts to the project:
 Building
 --------
 
-**There is a bug with dexlib 2.0.3 which can cause Simplify to fail often.**
-To work around, you must:
-* Clone and build [Smali](https://github.com/JesusFreke/smali)
-* Modify this line in [smalivm/build.gradle](smalivm/build.gradle) to point to the built jar, if different:
+To build, `./gradlew fatjar`
 
-`compile files('../../smali/dexlib2/build/libs/dexlib2-2.0.3-dev.jar')`
+The Simplify jar will be in `simplify/build/libs/simplify.jar`
 
-Sorry for this step. It won't be necessary once updated dexlib is released.
-
-To build the jar, use `./gradlew shadowJar`
+You can test it's working with: `java -jar simplify/build/libs/simplify.jar -i simplify/obfuscated-example`
 
 
 Troubleshooting
@@ -44,8 +41,8 @@ Troubleshooting
 
 Simplify is still in early stages of development. If you encounter a failure, try these recommendations, in order:
 
-1. Limit the target methods and classes to just the essentials with `-it`. Simplify will try and run over the entire app by default, which means more possibility for failure. Limiting to just one class or a few important methods improves chances significantly.
-2. If methods fail to simplify because of errors related to maximum visits exceeded, try using higher `--max-address-visits`, `--max-call-depth`, and `--max-method-visits`.
+1. Limit to just a few methods or classes `-it`.
+2. If failure is because of maximum visits exceeded, try using higher `--max-address-visits`, `--max-call-depth`, and `--max-method-visits`.
 3. Try with `-v` or `-vv` and report the issue.
 4. Try again, but do not break eye contact. Simpify can sense fear.
 
@@ -53,28 +50,18 @@ Simplify is still in early stages of development. If you encounter a failure, tr
 Reporting Issues
 ----------------
 
-Two main things are needed to reproduce and fix problems:
-
-1. The APK. If it's legal and possible, please link to the APK.
+1. If you can, link the **APK** or **DEX**.
 2. The full command used.
+3. *Optional*: verbose logs
 
-Optional, but still useful, is a verbose log output around the error.
-
-
-Reporting Success
------------------
-
-Did Simplify just save you a few hours of suffering? Send an e-mail to calebjfenton (AT) gmail [dot] com. If that's not your thing, send a pull request with bug fixes.
-
-
-
-### Optimization Example
-```
+Optimization Example
+--------------------
+### Before Optimization
+```smali
 .method public static test1()I
     .locals 2
 
     new-instance v0, Ljava/lang/Integer;
-
     const/4 v1, 0x1
     invoke-direct {v0, v1}, Ljava/lang/Integer;-><init>(I)V
 
@@ -85,36 +72,33 @@ Did Simplify just save you a few hours of suffering? Send an e-mail to calebjfen
 .end method
 ```
 
-The above code is an obtuse way to say `v0 = 1`. This is sometimes used as an obfuscation technique.
+All this does is `v0 = 1`.
 
 
-###After Constant Propagation
-```
+### After Constant Propagation
+```smali
 .method public static test1()I
     .locals 2
 
     new-instance v0, Ljava/lang/Integer;
-
     const/4 v1, 0x1
     invoke-direct {v0, v1}, Ljava/lang/Integer;-><init>(I)V
 
     invoke-virtual {v0}, Ljava/lang/Integer;->intValue()I
-    # move-result replaced with const/4
-    const/4 v0, 0x1
-
-    # known return register value prepended with const
     const/4 v0, 0x1
 
     return v0
 .end method
 ```
 
-Some single assignment instructions can be replaced with constant instructions when there is consensus of the value being assigned of all the possible executions of that instruction. If the instruction is outside of a loop, there will only be one node in the graph for that instruction.
-In this example `move-result` is constantized, as well as `return` because there is only one possible value (consensus) and it is not unkown.
+The `move-result v0` is replaced with `const/4 v0, 0x1`. This is because there is only one possible return value for `intValue()I` and the return type can be made a constant. The arguments `v0` and `v1` are unambiguous and do not change. That is to say, there's a consensus of values for every possible execution path at `intValue()I`. Other types of values that can be turned into constants:
 
+* numbers - `const/4`, `const/16`, etc.
+* strings - `const-string`
+* classes - `const-class`
 
 ###After Dead Code Removal
-```
+```smali
 .method public static test1()I
     .locals 2
 
@@ -124,8 +108,15 @@ In this example `move-result` is constantized, as well as `return` because there
 .end method
 ```
 
-Dead code includes:
+Because the code above `const/4 v0, 0x1` does not affect state outside of the method (no side-effects) it can be removed without changing behavior. If there was a method call that wrote something to the file system or network, it couldn't be removed because it affects state outside the method. Or if `test()I` took a mutable argument, such as a `LinkedList`, any instructions that accessed it couldn't be considered dead.
 
-* unreferenced assignments - assigning something and never using it
-* method calls with no side-effects - `Ljava/lang/Integer;->intValue()I` has no side-effects
-* unreached / unreachable instructions - code inside of an `if (false)` block, none in this example
+Some other examples of dead code:
+
+* unreferenced assignments - assigning registers and not using them
+* unreached / unreachable instructions - `if (false) { dead_code(); }`
+
+
+Related Works
+-------------
+
+* [Guillot, Yoann, and Alexandre Gazet. "Automatic Binary Deobfuscation." Journal in Computer Virology 6.3 (2010): 261-76](http://metasm.cr0.org/docs/sstic09-metasm-jcv.pdf)

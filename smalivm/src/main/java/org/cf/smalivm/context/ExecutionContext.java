@@ -2,75 +2,160 @@ package org.cf.smalivm.context;
 
 import gnu.trove.map.TMap;
 import gnu.trove.map.hash.THashMap;
-import gnu.trove.set.hash.THashSet;
 
+import java.util.HashSet;
+import java.util.Map.Entry;
 import java.util.Set;
 
 import org.cf.smalivm.SideEffect;
 import org.cf.smalivm.VirtualMachine;
+import org.cf.smalivm.exception.MaxAddressVisitsExceeded;
+import org.cf.smalivm.exception.MaxCallDepthExceeded;
+import org.cf.smalivm.exception.MaxMethodVisitsExceeded;
+import org.cf.smalivm.exception.UnhandledVirtualException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class ExecutionContext {
 
+    @SuppressWarnings("unused")
     private static final Logger log = LoggerFactory.getLogger(ExecutionContext.class.getSimpleName());
 
-    private int callDepth;
-    private final TMap<String, SideEffect.Level> classNameToSideEffectLevel;
+    private final VirtualMachine vm;
     private final TMap<String, ClassState> classNameToState;
+    private final TMap<String, ClassStatus> classNameToStatus;
     private final Heap heap;
-    private final Set<String> initializedClasses;
 
     private MethodState mState;
     private ExecutionContext parent;
-    private final VirtualMachine vm;
+    private String methodDescriptor;
 
-    public ExecutionContext(ExecutionContext other) {
-        vm = other.vm;
-        if (other.mState != null) {
-            mState = new MethodState(other.mState, this);
+    private ExecutionContext callerContext;
+    private int callerAddress;
+    private int callDepth;
+
+    private class ClassStatus {
+
+        private boolean isInitialized;
+        private ClassState cState;
+        private SideEffect.Level level;
+
+        ClassStatus(ClassState cState, SideEffect.Level level) {
+            this(cState);
+            this.level = level;
+            isInitialized = true;
         }
-        classNameToState = new THashMap<String, ClassState>(other.classNameToState.size());
-        classNameToSideEffectLevel = new THashMap<String, SideEffect.Level>(classNameToState.size());
-        for (String className : other.classNameToState.keySet()) {
-            ClassState otherClassState = other.peekClassState(className);
-            ClassState cState = new ClassState(otherClassState, this);
-            SideEffect.Level otherLevel = other.getClassStateSideEffectLevel(className);
-            setClassState(className, cState, otherLevel);
+
+        ClassStatus(ClassState cState) {
+            this.cState = cState;
         }
-        initializedClasses = new THashSet<String>(other.initializedClasses);
-        heap = new Heap(other.getHeap());
-        callDepth = other.getCallDepth();
+
+        ClassState getClassState() {
+            return cState;
+        }
+
+        SideEffect.Level getSideEffectLevel() {
+            return level;
+        }
+
+        boolean isInitialized() {
+            return isInitialized;
+        }
+
+        void setSideEffectLevel(SideEffect.Level level) {
+            this.level = level;
+            isInitialized = true;
+        }
     }
 
-    public ExecutionContext(VirtualMachine vm) {
+    public ExecutionContext(VirtualMachine vm, String methodDescriptor) {
         this.vm = vm;
-        classNameToState = new THashMap<String, ClassState>(0);
-        classNameToSideEffectLevel = new THashMap<String, SideEffect.Level>(0);
-        initializedClasses = new THashSet<String>(0);
+        this.methodDescriptor = methodDescriptor;
         heap = new Heap();
         callDepth = 0;
+
+        // Since there's a context per execution for each address, these maps are
+        // only populated as needed (by asking ancestors). So be frugal with size.
+        classNameToState = new THashMap<String, ClassState>(0);
+        classNameToStatus = new THashMap<String, ClassStatus>(0);
     }
 
     public int getCallDepth() {
         return callDepth;
     }
 
-    public ExecutionContext getChild() {
-        ExecutionContext child = new ExecutionContext(this.vm);
-        child.setCallDepth(callDepth);
-        child.setParent(this);
-        child.getHeap().setParent(this.getHeap());
+    public int getCallerAddress() {
+        return callerAddress;
+    }
 
-        // Almost every op access the method state
-        MethodState childMethodState = getMethodState().getChild(child);
-        child.setMethodState(childMethodState);
+    public ExecutionContext getCallerContext() {
+        return callerContext;
+    }
 
-        return child;
+    public SideEffect.Level getClassSideEffectLevel(String className) {
+        ExecutionContext ancestor = getAncestorWithClassName(className);
+        if (ancestor == null) {
+            return null;
+        }
+
+        return ancestor.classNameToStatus.get(className).getSideEffectLevel();
+    }
+
+    public Heap getHeap() {
+        return heap;
     }
 
     public Set<String> getInitializedClasses() {
-        return initializedClasses;
+        Set<String> classes = new HashSet<String>();
+        for (Entry<String, ClassStatus> entry : classNameToStatus.entrySet()) {
+            if (entry.getValue().isInitialized()) {
+                classes.add(entry.getKey());
+            }
+        }
+
+        return classes;
+    }
+
+    public String getMethodDescriptor() {
+        return methodDescriptor;
+    }
+
+    public MethodState getMethodState() {
+        return mState;
+    }
+
+    public void initializeClass(String className, ClassState cState, SideEffect.Level level) {
+        setClassState(className, cState);
+        setClassInitialized(className, level);
+    }
+
+    public boolean isClassInitialized(String className) {
+        ExecutionContext ancestor = getAncestorWithClassName(className);
+        if (ancestor == null) {
+            return false;
+        }
+
+        return ancestor.classNameToStatus.get(className).isInitialized();
+    }
+
+    public ClassState peekClassState(String className) {
+        ExecutionContext ancestor = getAncestorWithClassName(className);
+        if (ancestor == null) {
+            ClassState templateClassState = vm.getTemplateClassState(this, className);
+            setClassState(className, templateClassState);
+
+            return templateClassState;
+        } else if (ancestor != this) {
+            ClassState ancestorClassState = ancestor.peekClassState(className);
+            ClassState cState = ancestorClassState.getChild(this);
+            SideEffect.Level level = ancestor.getClassSideEffectLevel(className);
+            // Must initialize, because the ancestor probably just has the template class state.
+            initializeClass(className, cState, level);
+
+            return cState;
+        }
+
+        return classNameToStatus.get(className).getClassState();
     }
 
     public ClassState readClassState(String className) {
@@ -79,48 +164,26 @@ public class ExecutionContext {
         return peekClassState(className);
     }
 
-    public SideEffect.Level getClassStateSideEffectLevel(String className) {
-        ExecutionContext ancestor = getAncestorWithClassName(className);
-        if (ancestor == null) {
-            return null;
-        }
-
-        SideEffect.Level level = ancestor.classNameToSideEffectLevel.get(className);
-        if (ancestor != this) {
-            classNameToSideEffectLevel.put(className, level);
-        }
-
-        return level;
+    public void registerCaller(ExecutionContext callerContext, int callerAddress) {
+        this.callDepth = callerContext.getCallDepth() + 1;
+        this.callerContext = callerContext;
+        this.callerAddress = callerAddress;
     }
 
-    public Heap getHeap() {
-        return heap;
-    }
-
-    public MethodState getMethodState() {
-        return mState;
-    }
-
-    public void initializeClass(String className, ClassState cState, SideEffect.Level level) {
-        setClassState(className, cState, level);
-        setClassInitialized(className);
-    }
-
-    private void setClassInitialized(String className) {
-        initializedClasses.add(className);
-    }
-
-    public void setCallDepth(int callDepth) {
-        this.callDepth = callDepth;
-    }
-
-    public void setClassState(String className, ClassState cState, SideEffect.Level level) {
-        classNameToState.put(className, cState);
-        classNameToSideEffectLevel.put(className, level);
+    public void setClassState(String className, ClassState cState) {
+        // classNameToState.put(className, cState);
+        classNameToStatus.put(className, new ClassStatus(cState));
     }
 
     public void setMethodState(MethodState mState) {
         this.mState = mState;
+    }
+
+    public ExecutionContext spawnChild() {
+        ExecutionContext child = new ExecutionContext(vm, getMethodDescriptor());
+        child.setParent(this);
+
+        return child;
     }
 
     public void staticallyInitializeClassIfNecessary(String className) {
@@ -133,82 +196,39 @@ public class ExecutionContext {
             return;
         }
 
-        SideEffect.Level sideEffectLevel = SideEffect.Level.NONE;
         String clinitDescriptor = className + "-><clinit>()V";
         if (vm.getClassManager().isLocalMethod(clinitDescriptor)) {
-            ExecutionContext initContext = vm.getRootExecutionContext(clinitDescriptor);
-            initContext.setCallDepth(getCallDepth() + 1);
+            // TODO: determine what the call stack actually is when the vm clinit's a class
+            // this assumes the call stack is empty
+            ExecutionContext initContext = vm.spawnExecutionContext(clinitDescriptor);
 
             ClassState cState = initContext.peekClassState(className);
             initContext.initializeClass(className, cState, SideEffect.Level.NONE);
 
-            ExecutionGraph graph = vm.execute(clinitDescriptor, initContext, this, null);
+            ExecutionGraph graph = null;
+            try {
+                graph = vm.execute(clinitDescriptor, initContext, this, null);
+            } catch (MaxAddressVisitsExceeded | MaxCallDepthExceeded | MaxMethodVisitsExceeded e) {
+                log.warn(e.toString());
+            } catch (UnhandledVirtualException e) {
+                // TODO: handle this properly by bubbling up the exception
+                if (log.isWarnEnabled()) {
+                    log.warn(e.toString());
+                }
+            }
+
+            SideEffect.Level sideEffectLevel;
             if (graph == null) {
                 // Error executing. Assume the worst.
                 sideEffectLevel = SideEffect.Level.STRONG;
             } else {
                 sideEffectLevel = graph.getHighestSideEffectLevel();
             }
+            setClassSideEffectLevel(className, sideEffectLevel);
         } else {
-            // No clinit for this class.
-            setClassInitialized(className);
+            // No static initializer for this class.
+            setClassInitialized(className, SideEffect.Level.NONE);
         }
-        setClassSideEffectType(className, sideEffectLevel);
-    }
-
-    public boolean isClassInitialized(String className) {
-        ExecutionContext ancestor = getAncestorWithClassName(className);
-        if (ancestor == null) {
-            return false;
-        }
-
-        if (ancestor != this) {
-            if (ancestor.initializedClasses.contains(className)) {
-                initializedClasses.add(className);
-            }
-        }
-
-        return initializedClasses.contains(className);
-    }
-
-    private void setParent(ExecutionContext parent) {
-        this.parent = parent;
-    }
-
-    ExecutionContext getParent() {
-        return parent;
-    }
-
-    private ExecutionContext getAncestorWithClassName(String className) {
-        ExecutionContext ancestor = this;
-        do {
-            if (ancestor.classNameToState.containsKey(className)) {
-                return ancestor;
-            }
-
-            ancestor = ancestor.getParent();
-        } while (ancestor != null);
-
-        return ancestor;
-    }
-
-    public ClassState peekClassState(String className) {
-        ExecutionContext ancestor = getAncestorWithClassName(className);
-        if (ancestor == null) {
-            vm.addTemplateClassState(this, className);
-        } else if (ancestor != this) {
-            ClassState ancestorClassState = ancestor.peekClassState(className);
-            ClassState cState = ancestorClassState.getChild(this);
-            SideEffect.Level level = ancestor.getClassStateSideEffectLevel(className);
-            // Must initialize, because the ancestor probably just has the template class state.
-            initializeClass(className, cState, level);
-        }
-
-        return classNameToState.get(className);
-    }
-
-    void setClassSideEffectType(String className, SideEffect.Level sideEffectLevel) {
-        classNameToSideEffectLevel.put(className, sideEffectLevel);
     }
 
     @Override
@@ -218,17 +238,58 @@ public class ExecutionContext {
             sb.append("Method: ").append(mState.toString());
         }
         if (sb.length() > 0) {
-            sb.append("\n");
+            sb.append('\n');
         }
-        if (getInitializedClasses().size() < 4) {
-            // Too many and can blow up heap
-            for (String className : getInitializedClasses()) {
-                ClassState cState = peekClassState(className);
-                sb.append("Class: ").append(className).append(" ").append(cState);
+        Set<String> initializedClasses = getInitializedClasses();
+        if (initializedClasses.size() < 4) {
+            // Too many will trash the heap
+            for (String className : initializedClasses) {
+                // ClassState cState = peekClassState(className);
+                ClassState cState = classNameToStatus.get(className).getClassState();
+                sb.append("Class: ").append(className).append(' ').append(cState);
             }
         }
 
         return sb.toString();
+    }
+
+    private ExecutionContext getAncestorWithClassName(String className) {
+        ExecutionContext ancestor = this;
+        do {
+            ClassStatus status = ancestor.classNameToStatus.get(className);
+            if (status != null) {
+                return ancestor;
+            }
+
+            ancestor = ancestor.getParent();
+        } while (ancestor != null);
+
+        return null;
+    }
+
+    private void setClassInitialized(String className, SideEffect.Level level) {
+        peekClassState(className);
+        classNameToStatus.get(className).setSideEffectLevel(level);
+    }
+
+    private void setParent(ExecutionContext parent) {
+        assert parent.getMethodState() != null;
+
+        this.parent = parent;
+        callDepth = parent.getCallDepth();
+        getHeap().setParent(parent.getHeap());
+
+        MethodState childMethodState = parent.getMethodState().getChild(this);
+        setMethodState(childMethodState);
+    }
+
+    ExecutionContext getParent() {
+        return parent;
+    }
+
+    void setClassSideEffectLevel(String className, SideEffect.Level level) {
+        peekClassState(className);
+        classNameToStatus.get(className).setSideEffectLevel(level);
     }
 
 }

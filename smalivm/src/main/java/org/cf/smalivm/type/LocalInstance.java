@@ -1,9 +1,10 @@
 package org.cf.smalivm.type;
 
 import org.apache.commons.lang3.builder.EqualsBuilder;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.cf.smalivm.context.InstanceState;
 
-public class LocalInstance implements Type {
+public class LocalInstance implements LocalType {
 
     private InstanceState iState;
 
@@ -29,12 +30,18 @@ public class LocalInstance implements Type {
         return new EqualsBuilder().append(smaliType, rhs.smaliType).append(iState, rhs.iState).isEquals();
     }
 
+    @Override
+    public int hashCode() {
+        return new HashCodeBuilder(223, 197).append(getName()).append(iState).hashCode();
+    }
+
     public InstanceState getState() {
         // isInitialized -> iState != null ?
         return iState;
     }
 
-    public String getType() {
+    @Override
+    public String getName() {
         return smaliType;
     }
 

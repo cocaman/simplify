@@ -4,10 +4,10 @@ import java.lang.reflect.Array;
 import java.util.List;
 
 import org.apache.commons.lang3.ClassUtils;
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
 import org.cf.smalivm.context.MethodState;
-import org.cf.smalivm.type.UnknownValue;
-import org.jf.dexlib2.iface.instruction.Instruction;
-import org.jf.dexlib2.iface.instruction.formats.ArrayPayload;
+import org.jf.dexlib2.builder.MethodLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,32 +49,25 @@ public class FillArrayDataPayloadOp extends MethodStateOp {
         return value;
     }
 
-    static FillArrayDataPayloadOp create(Instruction instruction, int address) {
-        String opName = instruction.getOpcode().name;
-
-        ArrayPayload instr = (ArrayPayload) instruction;
-
-        return new FillArrayDataPayloadOp(address, opName, instr.getElementWidth(), instr.getArrayElements());
-    }
-
     private final List<Number> arrayElements;
-
     private final int elementWidth;
 
-    private FillArrayDataPayloadOp(int address, String opName, int elementWidth, List<Number> arrayElements) {
-        super(address, opName, 0); // childAddress / returnAddress not known until runtime
+    FillArrayDataPayloadOp(MethodLocation location, int elementWidth, List<Number> arrayElements) {
+        // childAddress / returnAddress not known until runtime
+        super(location);
 
         this.elementWidth = elementWidth;
         this.arrayElements = arrayElements;
     }
 
     @Override
-    public int[] execute(MethodState mState) {
+    public void execute(ExecutionNode node, MethodState mState) {
         MethodState parent = mState.getParent();
-        int register = parent.getRegistersAssigned().get(0);
+        int targetRegister = parent.getRegistersAssigned().toArray()[0];
         // Peek rather than read. This pseudo-instruction shouldn't count as an actual usage for the optimizer.
-        Object array = mState.peekRegister(register);
-        if (!(array instanceof UnknownValue)) {
+        HeapItem arrayItem = mState.peekRegister(targetRegister);
+        if (!arrayItem.isUnknown()) {
+            Object array = arrayItem.getValue();
             Class<?> expectedClass = array.getClass().getComponentType();
             for (int i = 0; i < arrayElements.size(); i++) {
                 Number number = arrayElements.get(i);
@@ -82,11 +75,11 @@ public class FillArrayDataPayloadOp extends MethodStateOp {
                 Array.set(array, i, value);
             }
             // Poke rather than assign for the optimizer.
-            mState.pokeRegister(register, array);
+            mState.pokeRegister(targetRegister, arrayItem);
         }
 
-        int returnAddress = mState.getParent().getPseudoInstructionReturnAddress();
-        return new int[] { returnAddress };
+        MethodLocation returnLocation = mState.getParent().getPseudoInstructionReturnInstruction();
+        node.setChildLocations(returnLocation);
     }
 
     @Override
@@ -100,4 +93,5 @@ public class FillArrayDataPayloadOp extends MethodStateOp {
 
         return sb.toString();
     }
+
 }

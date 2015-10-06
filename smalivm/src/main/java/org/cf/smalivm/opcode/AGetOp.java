@@ -2,22 +2,22 @@ package org.cf.smalivm.opcode;
 
 import java.lang.reflect.Array;
 
+import org.cf.smalivm.VirtualException;
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
 import org.cf.smalivm.context.MethodState;
-import org.cf.smalivm.type.UnknownValue;
-import org.jf.dexlib2.iface.instruction.Instruction;
-import org.jf.dexlib2.iface.instruction.formats.Instruction23x;
+import org.jf.dexlib2.builder.MethodLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class AGetOp extends MethodStateOp {
 
-    @SuppressWarnings("unused")
     private static final Logger log = LoggerFactory.getLogger(AGetOp.class.getSimpleName());
 
-    private static String getUnknownArrayInnerType(UnknownValue array) {
+    private static String getUnknownArrayInnerType(HeapItem array) {
         String outerType = array.getType();
         String result = null;
-        if (outerType.equals("?")) {
+        if ("?".equals(outerType)) {
             result = "?";
         } else {
             result = outerType.replaceFirst("\\[", "");
@@ -26,52 +26,61 @@ public class AGetOp extends MethodStateOp {
         return result;
     }
 
-    static AGetOp create(Instruction instruction, int address) {
-        String opName = instruction.getOpcode().name;
-        int childAddress = address + instruction.getCodeUnits();
-
-        Instruction23x instr = (Instruction23x) instruction;
-        int valueRegister = instr.getRegisterA();
-        int arrayRegister = instr.getRegisterB();
-        int indexRegister = instr.getRegisterC();
-
-        return new AGetOp(address, opName, childAddress, valueRegister, arrayRegister, indexRegister);
-    }
-
     private final int valueRegister;
     private final int arrayRegister;
     private final int indexRegister;
 
-    public AGetOp(int address, String opName, int childAddress, int valueRegister, int arrayRegister, int indexRegister) {
-        super(address, opName, childAddress);
+    AGetOp(MethodLocation location, MethodLocation child, int valueRegister, int arrayRegister, int indexRegister) {
+        super(location, child);
 
         this.valueRegister = valueRegister;
         this.arrayRegister = arrayRegister;
         this.indexRegister = indexRegister;
+
+        addException(new VirtualException(NullPointerException.class));
+        addException(new VirtualException(ArrayIndexOutOfBoundsException.class));
     }
 
     @Override
-    public int[] execute(MethodState mState) {
-        Object array = mState.readRegister(arrayRegister);
-        Object indexValue = mState.readRegister(indexRegister);
+    public void execute(ExecutionNode node, MethodState mState) {
+        HeapItem arrayItem = mState.readRegister(arrayRegister);
+        HeapItem indexItem = mState.readRegister(indexRegister);
 
-        Object value = null;
-        if (array instanceof UnknownValue) {
-            String innerType = getUnknownArrayInnerType((UnknownValue) array);
-            value = new UnknownValue(innerType);
+        HeapItem getItem;
+        if (arrayItem.isUnknown()) {
+            String innerType = getUnknownArrayInnerType(arrayItem);
+            getItem = HeapItem.newUnknown(innerType);
         } else {
-            if (indexValue instanceof UnknownValue) {
-                String innerType = array.getClass().getName().replaceFirst("\\[", "");
-                value = new UnknownValue(innerType);
+            Object array = arrayItem.getValue();
+            if (indexItem.isUnknown()) {
+                String innerType = arrayItem.getType().replaceFirst("\\[", "");
+                getItem = HeapItem.newUnknown(innerType);
             } else {
-                int index = (int) indexValue;
-                value = Array.get(array, index);
+                // All values known, so exceptions are deterministic.
+                node.clearExceptions();
+
+                if (null == array) {
+                    VirtualException exception = new VirtualException(NullPointerException.class);
+                    node.setException(exception);
+                    node.clearChildren();
+                    return;
+                }
+
+                int index = indexItem.getIntegerValue();
+                String innerType = arrayItem.getType().replaceFirst("\\[", "");
+                if (index >= Array.getLength(array)) {
+                    VirtualException exception = new VirtualException(ArrayIndexOutOfBoundsException.class);
+                    node.setException(exception);
+                    node.clearChildren();
+                    return;
+                } else {
+                    Object value = Array.get(array, index);
+                    getItem = new HeapItem(value, innerType);
+                    // node.clearExceptions();
+                }
             }
         }
-
-        mState.assignRegister(valueRegister, value);
-
-        return getPossibleChildren();
+        mState.assignRegister(valueRegister, getItem);
     }
 
     @Override

@@ -1,6 +1,7 @@
 .class Lchild_class;
 .super Lparent_class;
 
+.field public static childField:I
 
 # direct methods
 .method public constructor <init>()V
@@ -52,4 +53,10 @@
     move-result-object v0
 
     return-object v0
+.end method
+
+.method public static takesParameter(I)V
+    .locals 0
+
+    return-void
 .end method

@@ -2,22 +2,36 @@ package org.cf.simplify;
 
 import gnu.trove.list.TIntList;
 import gnu.trove.list.array.TIntArrayList;
+import gnu.trove.list.linked.TIntLinkedList;
 import gnu.trove.map.TIntObjectMap;
-import gnu.trove.map.hash.TIntObjectHashMap;
+import gnu.trove.set.TIntSet;
+import gnu.trove.set.hash.TIntHashSet;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
+
+import javax.annotation.Nullable;
 
 import org.cf.smalivm.VirtualMachine;
 import org.cf.smalivm.context.ExecutionContext;
 import org.cf.smalivm.context.ExecutionGraph;
 import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.MethodState;
+import org.cf.smalivm.opcode.FillArrayDataPayloadOp;
+import org.cf.smalivm.opcode.NopOp;
 import org.cf.smalivm.opcode.Op;
-import org.cf.smalivm.opcode.OpFactory;
-import org.cf.util.Utils;
+import org.cf.smalivm.opcode.OpCreator;
+import org.cf.smalivm.opcode.ReturnOp;
+import org.cf.smalivm.opcode.ReturnVoidOp;
+import org.cf.smalivm.opcode.SwitchPayloadOp;
 import org.jf.dexlib2.builder.BuilderInstruction;
 import org.jf.dexlib2.builder.BuilderTryBlock;
 import org.jf.dexlib2.builder.Label;
@@ -34,22 +48,11 @@ public class MethodBackedGraph extends ExecutionGraph {
     @SuppressWarnings("unused")
     private static final Logger log = LoggerFactory.getLogger(MethodBackedGraph.class.getSimpleName());
 
-    private static TIntObjectMap<BuilderInstruction> buildAddressToInstruction(List<BuilderInstruction> instructions) {
-        TIntObjectMap<BuilderInstruction> result = new TIntObjectHashMap<BuilderInstruction>();
-        for (BuilderInstruction instruction : instructions) {
-            int address = instruction.getLocation().getCodeAddress();
-            result.put(address, instruction);
-        }
-
-        return result;
-    }
-
-    private final TIntObjectMap<BuilderInstruction> addressToInstruction;
     private final DexBuilder dexBuilder;
     private final MutableMethodImplementation implementation;
     private final BuilderMethod method;
     private final String methodDescriptor;
-    private final OpFactory opFactory;
+    private OpCreator opCreator;
     private final VirtualMachine vm;
 
     public MethodBackedGraph(ExecutionGraph graph, BuilderMethod method, VirtualMachine vm, DexBuilder dexBuilder) {
@@ -59,69 +62,241 @@ public class MethodBackedGraph extends ExecutionGraph {
         this.method = method;
         this.methodDescriptor = ReferenceUtil.getMethodDescriptor(method);
         implementation = (MutableMethodImplementation) method.getImplementation();
-        addressToInstruction = buildAddressToInstruction(implementation.getInstructions());
         this.vm = vm;
-        opFactory = new OpFactory(vm, methodDescriptor);
+        opCreator = getOpCreator(vm, addressToLocation);
     }
 
-    public TIntObjectMap<BuilderInstruction> getAddressToInstruction() {
-        return addressToInstruction;
+    public void addInstruction(MethodLocation location, BuilderInstruction newInstruction) {
+        int index = location.getIndex();
+        implementation.addInstruction(index, newInstruction);
+
+        rebuildGraph();
+    }
+
+    public void addInstruction(int address, BuilderInstruction newInstruction) {
+        addInstruction(getLocation(address), newInstruction);
+    }
+
+    public TIntList getAvailableRegisters(int address) {
+        Deque<ExecutionNode> stack = new ArrayDeque<ExecutionNode>(getChildren(address));
+        ExecutionNode node = stack.peek();
+        if (null == node) {
+            // Edge case.
+            assert (getTemplateNode(address).getOp() instanceof ReturnOp) || (getTemplateNode(address).getOp() instanceof ReturnVoidOp);
+            MethodState mState = getNodePile(address).get(0).getContext().getMethodState();
+            TIntList available = new TIntLinkedList();
+            // They're all available!
+            for (int i = 0; i < mState.getRegisterCount(); i++) {
+                available.add(i);
+            }
+
+            return available;
+        }
+
+        int[] registers = new int[node.getContext().getMethodState().getRegisterCount()];
+        for (int i = 0; i < registers.length; i++) {
+            registers[i] = i;
+        }
+        TIntSet registersRead = new TIntHashSet();
+        TIntSet registersAssigned = new TIntHashSet();
+        while ((node = stack.poll()) != null) {
+            // TODO: easy - determine if dalvik allows you to overwrite the "this" register for instance methods
+            MethodState mState = node.getContext().getMethodState();
+            for (int register : registers) {
+                if (registersRead.contains(register) || registersAssigned.contains(register)) {
+                    continue;
+                }
+
+                if (node.getOp().getName().startsWith("move-result")) {
+                    // The target and result registers will always be identical. This makes it seem as if the register
+                    // has always been read since it was read when it was in the result register.
+                    continue;
+                }
+
+                if (mState.wasRegisterRead(register)) {
+                    registersRead.add(register);
+                } else if (mState.wasRegisterAssigned(register)) {
+                    registersAssigned.add(register);
+                }
+            }
+            stack.addAll(node.getChildren());
+        }
+
+        TIntList available = new TIntLinkedList();
+        for (int register : registers) {
+            if (registersRead.contains(register)) {
+                continue;
+            }
+            available.add(register);
+        }
+
+        return available;
+    }
+
+    public List<ExecutionNode> getChildren(int address) {
+        List<ExecutionNode> children = new ArrayList<ExecutionNode>();
+        List<ExecutionNode> nodePile = getNodePile(address);
+        for (ExecutionNode node : nodePile) {
+            children.addAll(node.getChildren());
+        }
+
+        return children;
     }
 
     public DexBuilder getDexBuilder() {
         return dexBuilder;
     }
 
-    public BuilderInstruction getInstruction(int address) {
-        return addressToInstruction.get(address);
+    public @Nullable BuilderInstruction getInstruction(int address) {
+        ExecutionNode node = getTemplateNode(address);
+
+        return node.getOp().getInstruction();
+    }
+
+    public TIntList getParentAddresses(int address) {
+        TIntSet parentAddressSet = new TIntHashSet();
+        for (ExecutionNode node : getNodePile(address)) {
+            ExecutionNode parent = node.getParent();
+            if (null == parent) {
+                continue;
+            }
+            parentAddressSet.add(parent.getAddress());
+        }
+        TIntList parentAddresses = new TIntArrayList(parentAddressSet);
+
+        return parentAddresses;
     }
 
     public List<BuilderTryBlock> getTryBlocks() {
         return implementation.getTryBlocks();
     }
 
+    public VirtualMachine getVM() {
+        return vm;
+    }
+
+    public void removeInstruction(MethodLocation location) {
+        int index = location.getIndex();
+        tryMigrateLabels(index);
+        implementation.removeInstruction(index);
+        removeEmptyTryCatchBlocks();
+
+        rebuildGraph();
+    }
+
     public void removeInstruction(int address) {
-        removeInstructions(new TIntArrayList(new int[] { address }));
+        removeInstruction(getLocation(address));
     }
 
     public void removeInstructions(TIntList addresses) {
-        /*
-         * Implementation removes by index, not address. Collect indexes and update addressToInstruction map. Also,
-         * while looping, remove orphaned debug items, or you're gonna have a bad time.
-         */
-        TIntList indexes = new TIntArrayList();
         addresses.sort();
         addresses.reverse();
-        if (log.isInfoEnabled()) {
-            log.info("Remove addresses: " + addresses);
-        }
         for (int address : addresses.toArray()) {
-            BuilderInstruction instruction = addressToInstruction.get(address);
-            MethodLocation location = instruction.getLocation();
-            location.getDebugItems().clear();
-            if (log.isDebugEnabled()) {
-                log.debug("@" + address + " is index " + location.getIndex());
-            }
-            indexes.add(location.getIndex());
-
-            // Shifting down also removes this address key
-            int shift = -instruction.getCodeUnits();
-            Utils.shiftIntegerMapKeys(address, shift, addressToInstruction);
-            removeNodePile(address, shift);
+            removeInstruction(address);
         }
-
-        // Go in reverse order because implementation reorders on removal
-        indexes.sort();
-        indexes.reverse();
-        for (int index : indexes.toArray()) {
-            tryMigrateLabels(index);
-
-            implementation.removeInstruction(index);
-        }
-
-        removeEmptyTryCatchBlocks();
     }
 
+    public void replaceInstruction(int address, BuilderInstruction instruction) {
+        removeInstruction(getLocation(address));
+        addInstruction(getLocation(address), instruction);
+    }
+
+    public void replaceInstruction(int insertAddress, List<BuilderInstruction> instructions) {
+        MethodLocation location = getLocation(insertAddress);
+        int address = location.getCodeAddress();
+        removeInstruction(location);
+        for (BuilderInstruction instruction : instructions) {
+            addInstruction(address, instruction);
+            address += instruction.getCodeUnits();
+        }
+    }
+
+    public String toSmali() {
+        int[] addresses = getAddresses();
+        Arrays.sort(addresses);
+        StringBuilder sb = new StringBuilder();
+        for (int address : addresses) {
+            Op op = getOp(address);
+            sb.append(op.toString()).append('\n');
+        }
+        sb.setLength(sb.length() - 1);
+
+        return sb.toString();
+    }
+
+    private void addToNodePile(MethodLocation newLocation) {
+        int oldIndex = newLocation.getIndex() + 1;
+        MethodLocation shiftedLocation = null;
+        for (MethodLocation location : locationToNodePile.keySet()) {
+            if (location.getIndex() == oldIndex) {
+                shiftedLocation = location;
+                break;
+            }
+        }
+        List<ExecutionNode> shiftedNodePile = locationToNodePile.get(shiftedLocation);
+        List<ExecutionNode> newNodePile = new ArrayList<ExecutionNode>();
+        locationToNodePile.put(newLocation, newNodePile);
+
+        Op shiftedOp = shiftedNodePile.get(0).getOp();
+        Op op = opCreator.create(newLocation);
+        boolean padding = (op instanceof NopOp && (shiftedOp instanceof FillArrayDataPayloadOp || shiftedOp instanceof SwitchPayloadOp));
+        for (int i = 0; i < shiftedNodePile.size(); i++) {
+            ExecutionNode newNode = new ExecutionNode(op);
+            newNodePile.add(i, newNode);
+
+            if (padding) {
+                break;
+            }
+            if (i == TEMPLATE_NODE_INDEX) {
+                continue;
+            }
+
+            ExecutionNode shiftedNode = shiftedNodePile.get(i);
+            ExecutionNode parentNode = shiftedNode.getParent();
+            ExecutionContext newContext;
+            if (parentNode != null) {
+                parentNode.replaceChild(shiftedNode, newNode);
+                newContext = parentNode.getContext().spawnChild();
+            } else {
+                assert METHOD_ROOT_ADDRESS == newLocation.getCodeAddress();
+                newContext = vm.spawnExecutionContext(methodDescriptor);
+            }
+            shiftedNode.setParentNode(newNode);
+            newNode.setContext(newContext);
+
+            // Execute to set children and context
+            newNode.execute();
+        }
+    }
+
+    private void rebuildGraph() {
+        Set<MethodLocation> staleLocations = locationToNodePile.keySet();
+        Set<MethodLocation> freshLocations = new HashSet<MethodLocation>();
+        for (BuilderInstruction instruction : implementation.getInstructions()) {
+            freshLocations.add(instruction.getLocation());
+        }
+
+        Set<MethodLocation> addedLocations = new HashSet<MethodLocation>(freshLocations);
+        addedLocations.removeAll(staleLocations);
+        for (MethodLocation location : addedLocations) {
+            addToNodePile(location);
+        }
+        Set<MethodLocation> removedLocations = new HashSet<MethodLocation>(staleLocations);
+        removedLocations.removeAll(freshLocations);
+        for (MethodLocation location : removedLocations) {
+            removeFromNodePile(location);
+        }
+
+        TIntObjectMap<MethodLocation> newAddressToLocation = buildAddressToLocation(implementation);
+        addressToLocation.clear();
+        addressToLocation.putAll(newAddressToLocation);
+    }
+
+    public MethodLocation getLocation(int address) {
+        return addressToLocation.get(address);
+    }
+
+    @SuppressWarnings("unchecked")
     private void removeEmptyTryCatchBlocks() {
         /*
          * MutableMethodImplementation#getTryBlocks() returns immutable collection. Maybe dexlib should be smart enough
@@ -156,7 +331,7 @@ public class MethodBackedGraph extends ExecutionGraph {
             }
         }
 
-        // Remove from the end to avoid re-indexing
+        // Remove from the end to avoid re-indexing invalidations
         indexes.sort();
         indexes.reverse();
         for (int index : indexes.toArray()) {
@@ -164,15 +339,45 @@ public class MethodBackedGraph extends ExecutionGraph {
         }
     }
 
+    private void removeFromNodePile(MethodLocation location) {
+        List<ExecutionNode> nodePile = locationToNodePile.get(location);
+        locationToNodePile.remove(location);
+        Map<MethodLocation, ExecutionNode> locationToChildNodeToRemove = new HashMap<MethodLocation, ExecutionNode>();
+        for (ExecutionNode removedNode : nodePile) {
+            ExecutionNode parentNode = removedNode.getParent();
+            if (parentNode != null) {
+                parentNode.removeChild(removedNode);
+            }
+            for (ExecutionNode childNode : removedNode.getChildren()) {
+                // parentNode could be null, and that's ok
+                Op op = childNode.getOp();
+                boolean pseudoChild = (op instanceof FillArrayDataPayloadOp || op instanceof SwitchPayloadOp);
+                if (!pseudoChild) {
+                    childNode.setParentNode(parentNode);
+                } else {
+                    for (ExecutionNode grandChildNode : childNode.getChildren()) {
+                        grandChildNode.setParentNode(parentNode);
+                    }
+                    locationToChildNodeToRemove.put(childNode.getOp().getLocation(), childNode);
+                }
+            }
+        }
+        for (Entry<MethodLocation, ExecutionNode> entry : locationToChildNodeToRemove.entrySet()) {
+            List<ExecutionNode> pile = locationToNodePile.get(entry.getKey());
+            pile.remove(entry.getValue());
+        }
+    }
+
     private void tryMigrateLabels(int index) {
         // If it has a label, and it's not the last instruction, move it to the next instruction.
-        int instructionCount = implementation.getInstructions().size();
+        List<BuilderInstruction> instructions = implementation.getInstructions();
+        int instructionCount = instructions.size();
         if (index < (instructionCount - 1)) {
             // Not last instruction
-            BuilderInstruction moveFrom = implementation.getInstructions().get(index);
+            BuilderInstruction moveFrom = instructions.get(index);
             Set<Label> labelSet = moveFrom.getLocation().getLabels();
             if (0 < labelSet.size()) {
-                BuilderInstruction moveTo = implementation.getInstructions().get(index + 1);
+                BuilderInstruction moveTo = instructions.get(index + 1);
                 List<Label> labels = new ArrayList<Label>(labelSet.size());
                 for (Label label : labels) {
                     moveTo.getLocation().getLabels().add(label);
@@ -182,106 +387,9 @@ public class MethodBackedGraph extends ExecutionGraph {
         }
     }
 
-    public void replaceInstruction(int address, BuilderInstruction replacement) {
-        BuilderInstruction original = getInstruction(address);
-        int index = original.getLocation().getIndex();
-        implementation.replaceInstruction(index, replacement);
-        addressToInstruction.put(address, replacement);
-
-        int codeUnits = replacement.getCodeUnits();
-        int shift = codeUnits - original.getCodeUnits();
-        Utils.shiftIntegerMapKeys(address, shift, addressToInstruction);
-
-        Op op = opFactory.create(replacement, address);
-        replaceInstruction(address, shift, op, codeUnits);
-    }
-
-    public void insertInstruction(int address, BuilderInstruction instruction) {
-        BuilderInstruction original = addressToInstruction.get(address);
-        int index = original.getLocation().getIndex();
-
-        // addInstruction(int, instruction) will insert with reindex
-        implementation.addInstruction(index, instruction);
-        int shift = instruction.getCodeUnits();
-        Utils.shiftIntegerMapKeys(address - original.getCodeUnits(), shift, addressToInstruction);
-    }
-
-    private void removeNodePile(int address, int shift) {
-        List<ExecutionNode> nodePile = addressToNodePile.get(address);
-        for (ExecutionNode removedNode : nodePile) {
-            ExecutionNode parentNode = removedNode.getParent();
-            if (parentNode != null) {
-                parentNode.removeChild(removedNode);
-            }
-            for (ExecutionNode childNode : removedNode.getChildren()) {
-                // parentNode could be null, and that's ok
-                childNode.setParent(parentNode);
-            }
-        }
-
-        // addressToNodePile.remove(address);
-        // Ops in node pile still have old addresses
-        Utils.shiftIntegerMapKeys(address, shift, addressToNodePile);
-    }
-
-    /*
-     * Need to be able to update a graph to pass around between optimization strategies. This does a shallow update, not
-     * touching any handlers or individual nodes. It just updates addressToNodePile by shifting addresses up or down,
-     * depending on delta between old and new instruction. It also executes the new instruction to build a realistic
-     * context to help optimizer, i.e. assigned registers, etc.
-     */
-    protected void replaceInstruction(int address, int addressShift, Op op, int codeUnits) {
-        List<ExecutionNode> nodePile = addressToNodePile.get(address);
-        Map<ExecutionNode, ExecutionNode> replacedToNew = new HashMap<ExecutionNode, ExecutionNode>();
-        for (int index = 0; index < nodePile.size(); index++) {
-            ExecutionNode replacedNode = nodePile.get(index);
-            ExecutionNode newNode = new ExecutionNode(op);
-            nodePile.set(index, newNode);
-
-            if (index == TEMPLATE_NODE_INDEX) {
-                assert replacedNode.getContext() == null;
-                assert replacedNode.getParent() == null;
-                assert replacedNode.getChildren().size() == 0;
-
-                continue;
-            }
-
-            for (ExecutionNode child : replacedNode.getChildren()) {
-                child.setParent(newNode);
-            }
-
-            ExecutionNode parentNode = replacedNode.getParent();
-            ExecutionContext newContext;
-            if (parentNode != null) {
-                parentNode.replaceChild(replacedNode, newNode);
-                newContext = parentNode.getContext().getChild();
-            } else {
-                assert address == METHOD_ROOT_ADDRESS;
-                newContext = vm.getRootExecutionContext(methodDescriptor);
-            }
-            newNode.setContext(newContext);
-            newNode.execute();
-
-            replacedToNew.put(replacedNode, newNode);
-        }
-
-        // Update any children's parents to the new nodes we made.
-        Utils.shiftIntegerMapKeys(address, addressShift, addressToNodePile);
-        int childAddress = address + codeUnits;
-        nodePile = getNodePile(childAddress);
-        if (nodePile != null) {
-            for (ExecutionNode node : nodePile) {
-                ExecutionNode parent = node.getParent();
-                if (replacedToNew.containsKey(parent)) {
-                    node.setParent(replacedToNew.get(parent));
-                }
-            }
-        }
-    }
-
     TIntList getReachedAddresses() {
         TIntList result = new TIntArrayList();
-        for (int address : addressToInstruction.keys()) {
+        for (int address : addressToLocation.keys()) {
             if (wasAddressReached(address)) {
                 result.add(address);
             }

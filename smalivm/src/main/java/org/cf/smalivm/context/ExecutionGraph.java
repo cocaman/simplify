@@ -6,22 +6,24 @@ import gnu.trove.map.TIntObjectMap;
 import gnu.trove.map.hash.TIntObjectHashMap;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import javax.annotation.Nullable;
+
 import org.cf.smalivm.SideEffect;
 import org.cf.smalivm.VirtualMachine;
 import org.cf.smalivm.opcode.Op;
-import org.cf.smalivm.opcode.OpFactory;
-import org.cf.smalivm.type.TypeUtil;
-import org.cf.smalivm.type.UnknownValue;
-import org.cf.util.SmaliClassUtils;
+import org.cf.smalivm.opcode.OpCreator;
 import org.jf.dexlib2.Opcode;
 import org.jf.dexlib2.builder.BuilderInstruction;
+import org.jf.dexlib2.builder.MethodLocation;
 import org.jf.dexlib2.builder.MutableMethodImplementation;
 import org.jf.dexlib2.util.ReferenceUtil;
 import org.jf.dexlib2.writer.builder.BuilderMethod;
@@ -35,26 +37,29 @@ public class ExecutionGraph implements Iterable<ExecutionNode> {
     protected static final int TEMPLATE_NODE_INDEX = 0;
     protected static final int METHOD_ROOT_ADDRESS = 0;
 
-    private static TIntObjectMap<List<ExecutionNode>> buildAddressToNodePile(VirtualMachine vm,
-                    String methodDescriptor, List<BuilderInstruction> instructions) {
-        OpFactory opFactory = new OpFactory(vm, methodDescriptor);
-        TIntObjectMap<List<ExecutionNode>> result = new TIntObjectHashMap<List<ExecutionNode>>();
-        for (BuilderInstruction instruction : instructions) {
-            int address = instruction.getLocation().getCodeAddress();
-            Op op = opFactory.create(instruction, address);
+    protected static OpCreator getOpCreator(VirtualMachine vm, TIntObjectMap<MethodLocation> addressToLocation) {
+        return new OpCreator(vm, addressToLocation);
+    }
+
+    private static Map<MethodLocation, List<ExecutionNode>> buildLocationToNodePile(VirtualMachine vm,
+                    TIntObjectMap<MethodLocation> addressToLocation) {
+        OpCreator opCreator = getOpCreator(vm, addressToLocation);
+        Map<MethodLocation, List<ExecutionNode>> locationToNodePile = new HashMap<MethodLocation, List<ExecutionNode>>();
+        for (MethodLocation location : addressToLocation.values(new MethodLocation[addressToLocation.size()])) {
+            Op op = opCreator.create(location);
             ExecutionNode node = new ExecutionNode(op);
 
             // Most node piles will be a template node and one or more ContextNodes.
             List<ExecutionNode> nodePile = new ArrayList<ExecutionNode>(2);
             nodePile.add(node);
-            result.put(address, nodePile);
+            locationToNodePile.put(location, nodePile);
         }
 
-        return result;
+        return locationToNodePile;
     }
 
     private static TIntList buildTerminatingAddresses(List<BuilderInstruction> instructions) {
-        TIntList result = new TIntArrayList(1);
+        TIntList result = new TIntArrayList();
         for (BuilderInstruction instruction : instructions) {
             int address = instruction.getLocation().getCodeAddress();
             /*
@@ -72,86 +77,75 @@ public class ExecutionGraph implements Iterable<ExecutionNode> {
         return result;
     }
 
-    private final String methodDescriptor;
-    private final TIntList terminatingAddresses;
-    protected final TIntObjectMap<List<ExecutionNode>> addressToNodePile;
-
-    public ExecutionGraph(ExecutionGraph other) {
-        methodDescriptor = other.methodDescriptor;
-        addressToNodePile = new TIntObjectHashMap<List<ExecutionNode>>();
-        for (int address : other.addressToNodePile.keys()) {
-            List<ExecutionNode> otherNodePile = other.addressToNodePile.get(address);
-            List<ExecutionNode> nodePile = new ArrayList<ExecutionNode>(otherNodePile.size());
-            for (ExecutionNode otherNode : otherNodePile) {
-                nodePile.add(new ExecutionNode(otherNode));
-            }
-            addressToNodePile.put(address, nodePile);
-        }
-        terminatingAddresses = other.terminatingAddresses;
-    }
-
-    public ExecutionGraph(ExecutionGraph other, boolean wrap) {
-        this.addressToNodePile = other.addressToNodePile;
-        this.methodDescriptor = other.methodDescriptor;
-        this.terminatingAddresses = other.terminatingAddresses;
-    }
-
-    public ExecutionGraph(VirtualMachine vm, BuilderMethod method) {
-        methodDescriptor = ReferenceUtil.getMethodDescriptor(method);
-        MutableMethodImplementation implementation = (MutableMethodImplementation) method.getImplementation();
-        List<BuilderInstruction> instructions = implementation.getInstructions();
-        addressToNodePile = buildAddressToNodePile(vm, methodDescriptor, instructions);
-        terminatingAddresses = buildTerminatingAddresses(instructions);
-    }
-
-    public void addNode(ExecutionNode node) {
-        addressToNodePile.get(node.getAddress()).add(node);
-    }
-
-    public int[] getAddresses() {
-        return addressToNodePile.keySet().toArray();
-    }
-
-    public TIntList getConnectedTerminatingAddresses() {
-        TIntList result = new TIntArrayList(1);
-        for (int i = 0; i < terminatingAddresses.size(); i++) {
-            int address = terminatingAddresses.get(i);
-            if (wasAddressReached(address)) {
-                result.add(address);
-            }
+    private static TIntObjectMap<BuilderInstruction> buildAddressToInstruction(List<BuilderInstruction> instructions) {
+        TIntObjectMap<BuilderInstruction> result = new TIntObjectHashMap<BuilderInstruction>();
+        for (BuilderInstruction instruction : instructions) {
+            int address = instruction.getLocation().getCodeAddress();
+            result.put(address, instruction);
         }
 
         return result;
     }
 
-    public Object getFieldConsensus(TIntList addressList, String fieldDescriptor) {
-        String[] parts = fieldDescriptor.split("->");
+    private final String methodDescriptor;
+    private final TIntList terminatingAddresses;
+    // protected final TIntObjectMap<List<ExecutionNode>> addressToNodePile;
+    protected final Map<MethodLocation, List<ExecutionNode>> locationToNodePile;
+    protected final TIntObjectMap<MethodLocation> addressToLocation;
 
-        return getFieldConsensus(addressList, parts[0], parts[1]);
+    public ExecutionGraph(ExecutionGraph other) {
+        methodDescriptor = other.methodDescriptor;
+        locationToNodePile = new HashMap<MethodLocation, List<ExecutionNode>>();
+        for (MethodLocation location : other.locationToNodePile.keySet()) {
+            List<ExecutionNode> otherNodePile = other.locationToNodePile.get(location);
+            List<ExecutionNode> nodePile = new ArrayList<ExecutionNode>(otherNodePile.size());
+            for (ExecutionNode otherNode : otherNodePile) {
+                nodePile.add(new ExecutionNode(otherNode));
+            }
+            locationToNodePile.put(location, nodePile);
+        }
+        terminatingAddresses = other.terminatingAddresses;
+        addressToLocation = other.addressToLocation;
     }
 
-    public Object getFieldConsensus(TIntList addressList, String className, String fieldNameAndType) {
-        Object value = null;
-        String[] parts = fieldNameAndType.split(":");
-        String type = parts[1];
+    public ExecutionGraph(ExecutionGraph other, boolean wrap) {
+        locationToNodePile = other.locationToNodePile;
+        methodDescriptor = other.methodDescriptor;
+        terminatingAddresses = other.terminatingAddresses;
+        addressToLocation = other.addressToLocation;
+    }
 
-        for (int address : addressList.toArray()) {
-            // If the class wasn't initialized in one path, it's unknown
-            for (ExecutionNode node : getNodePile(address)) {
-                if (!node.getContext().isClassInitialized(className)) {
-                    return new UnknownValue(type);
-                }
-            }
+    public ExecutionGraph(VirtualMachine vm, BuilderMethod method) {
+        methodDescriptor = ReferenceUtil.getMethodDescriptor(method);
+        MutableMethodImplementation implementation = (MutableMethodImplementation) method.getImplementation();
+        addressToLocation = buildAddressToLocation(implementation);
+        locationToNodePile = buildLocationToNodePile(vm, addressToLocation);
+        List<BuilderInstruction> instructions = implementation.getInstructions();
+        terminatingAddresses = buildTerminatingAddresses(instructions);
+    }
 
-            Set<Object> values = getFieldValues(address, className, fieldNameAndType);
-            value = values.toArray()[0]; // since set, size == 1 -> consensus
-            if (1 != values.size()) {
-                log.trace("No conensus for " + className + "->" + fieldNameAndType + ", returning unknown");
-                return new UnknownValue(type);
-            }
+    protected static TIntObjectMap<MethodLocation> buildAddressToLocation(MutableMethodImplementation implementation) {
+        TIntObjectMap<MethodLocation> addressToLocation = new TIntObjectHashMap<MethodLocation>();
+        for (BuilderInstruction instruction : implementation.getInstructions()) {
+            MethodLocation location = instruction.getLocation();
+            int address = location.getCodeAddress();
+            addressToLocation.put(address, location);
         }
 
-        return value;
+        return addressToLocation;
+    }
+
+    public void addNode(ExecutionNode node) {
+        MethodLocation location = node.getOp().getInstruction().getLocation();
+        locationToNodePile.get(location).add(node);
+    }
+
+    public int[] getAddresses() {
+        return addressToLocation.keys();
+    }
+
+    public Collection<MethodLocation> getLocations() {
+        return addressToLocation.valueCollection();
     }
 
     public Set<String> getAllPossiblyInitializedClasses(TIntList addressList) {
@@ -166,49 +160,63 @@ public class ExecutionGraph implements Iterable<ExecutionNode> {
         return allClasses;
     }
 
-    public Set<Object> getFieldValues(int address, String className, String fieldNameAndType) {
-        List<ExecutionNode> nodePile = getNodePile(address);
-        Set<Object> result = new HashSet<Object>(nodePile.size());
-        for (ExecutionNode node : nodePile) {
-            ClassState cState = node.getContext().peekClassState(className);
-            Object value = cState.peekField(fieldNameAndType);
-            result.add(value);
+    public TIntList getConnectedTerminatingAddresses() {
+        TIntList result = new TIntArrayList(1);
+        for (int i = 0; i < terminatingAddresses.size(); i++) {
+            int address = terminatingAddresses.get(i);
+            if (wasAddressReached(address)) {
+                result.add(address);
+            }
         }
 
         return result;
     }
 
-    public String getMethodDescriptor() {
-        return methodDescriptor;
+    public HeapItem getFieldConsensus(TIntList addressList, String fieldDescriptor) {
+        String[] parts = fieldDescriptor.split("->");
+        String className = parts[0];
+        String fieldNameAndType = parts[1];
+
+        return getFieldConsensus(addressList, className, fieldNameAndType);
     }
 
-    public int getNodeCount() {
-        int totalSize = addressToNodePile.size();
-        int templateCount = addressToNodePile.keys().length;
+    public HeapItem getFieldConsensus(TIntList addressList, String className, String fieldNameAndType) {
+        String[] parts = fieldNameAndType.split(":");
+        String type = parts[1];
+        Set<HeapItem> items = new HashSet<HeapItem>();
+        for (int address : addressList.toArray()) {
+            // If the class wasn't initialized in one path, it's unknown
+            for (ExecutionNode node : getNodePile(address)) {
+                if (!node.getContext().isClassInitialized(className)) {
+                    return HeapItem.newUnknown(type);
+                }
+            }
 
-        return totalSize - templateCount;
+            items.addAll(getFieldItems(address, className, fieldNameAndType));
+            if (1 != items.size()) {
+                // since set, size == 1 -> consensus
+                if (log.isTraceEnabled()) {
+                    log.trace("No conensus for " + className + "->" + fieldNameAndType + ", returning unknown");
+                }
+
+                return HeapItem.newUnknown(type);
+            }
+        }
+
+        return items.toArray(new HeapItem[items.size()])[0];
     }
 
-    public List<ExecutionNode> getNodePile(int address) {
-        List<ExecutionNode> result = addressToNodePile.get(address);
-        result = result.subList(1, result.size());
+    public Set<HeapItem> getFieldItems(int address, String className, String fieldNameAndType) {
+        List<ExecutionNode> nodePile = getNodePile(address);
+        Set<HeapItem> items = new HashSet<HeapItem>(nodePile.size());
+        for (ExecutionNode node : nodePile) {
+            ExecutionContext ectx = node.getContext();
+            ClassState cState = ectx.peekClassState(className);
+            HeapItem item = cState.peekField(fieldNameAndType);
+            items.add(item);
+        }
 
-        return result;
-    }
-
-    public Op getOp(int address) {
-        List<ExecutionNode> pile = addressToNodePile.get(address);
-        // same pile implies same op
-        ExecutionNode bottomNode = pile.get(TEMPLATE_NODE_INDEX);
-
-        return bottomNode.getOp();
-    }
-
-    public Object getRegisterConsensus(int address, int register) {
-        TIntList addresses = new TIntArrayList(1);
-        addresses.add(address);
-
-        return getRegisterConsensus(addresses, register);
+        return items;
     }
 
     public SideEffect.Level getHighestClassSideEffectLevel(String className) {
@@ -217,7 +225,7 @@ public class ExecutionGraph implements Iterable<ExecutionNode> {
         for (int address : addressList.toArray()) {
             List<ExecutionNode> pile = getNodePile(address);
             for (ExecutionNode node : pile) {
-                SideEffect.Level level = node.getContext().getClassStateSideEffectLevel(className);
+                SideEffect.Level level = node.getContext().getClassSideEffectLevel(className);
                 if (level == null) {
                     // Maybe the class wasn't initialized.
                     continue;
@@ -237,42 +245,23 @@ public class ExecutionGraph implements Iterable<ExecutionNode> {
         return result;
     }
 
-    public Object getRegisterConsensus(TIntList addressList, int register) {
-        Object value = null;
-        for (int address : addressList.toArray()) {
-            Set<Object> values = getRegisterValues(address, register);
-            value = values.toArray()[0];
-            if (values.size() != 1) {
-                log.trace("No conensus for register #" + register + ", returning unknown");
-                String type = SmaliClassUtils.javaClassToSmali(TypeUtil.getValueType(value));
-
-                return new UnknownValue(type);
+    public SideEffect.Level getHighestMethodSideEffectLevel() {
+        SideEffect.Level result = SideEffect.Level.NONE;
+        for (ExecutionNode node : this) {
+            Op op = node.getOp();
+            SideEffect.Level level = op.sideEffectLevel();
+            switch (level) {
+            case STRONG:
+                return level;
+            case WEAK:
+                result = level;
+                break;
+            case NONE:
+                break;
             }
         }
 
-        return value;
-    }
-
-    public Set<Object> getRegisterValues(int address, int register) {
-        List<ExecutionNode> nodePile = getNodePile(address);
-        Set<Object> result = new HashSet<Object>(nodePile.size());
-        for (ExecutionNode node : nodePile) {
-            MethodState mState = node.getContext().getMethodState();
-            Object value = mState.peekRegister(register);
-            result.add(value);
-        }
-
         return result;
-    }
-
-    public ExecutionNode getRoot() {
-        List<ExecutionNode> pile = addressToNodePile.get(METHOD_ROOT_ADDRESS);
-        // Return node with initialized context if available.
-        if (pile.size() > 1) {
-            return pile.get(1);
-        } else {
-            return pile.get(TEMPLATE_NODE_INDEX);
-        }
     }
 
     public SideEffect.Level getHighestSideEffectLevel() {
@@ -299,58 +288,162 @@ public class ExecutionGraph implements Iterable<ExecutionNode> {
         return result;
     }
 
-    public SideEffect.Level getHighestMethodSideEffectLevel() {
-        SideEffect.Level result = SideEffect.Level.NONE;
-        for (ExecutionNode node : this) {
-            Op op = node.getOp();
-            SideEffect.Level level = op.sideEffectLevel();
-            switch (level) {
-            case STRONG:
-                return level;
-            case WEAK:
-                result = level;
-                break;
-            case NONE:
-                break;
+    public String getMethodDescriptor() {
+        return methodDescriptor;
+    }
+
+    public int getNodeCount() {
+        int totalSize = locationToNodePile.size();
+        int templateCount = locationToNodePile.keySet().size();
+
+        return totalSize - templateCount;
+    }
+
+    private @Nullable List<ExecutionNode> getNodePileByAddress(int address) {
+        MethodLocation location = addressToLocation.get(address);
+
+        return locationToNodePile.get(location);
+    }
+
+    public List<ExecutionNode> getNodePile(int address) {
+        List<ExecutionNode> nodePile = getNodePileByAddress(address);
+        nodePile = nodePile.subList(1, nodePile.size()); // exclude template
+
+        return nodePile;
+    }
+
+    public Op getOp(int address) {
+        // Node piles share an Op reference
+        return getTemplateNode(address).getOp();
+    }
+
+    public HeapItem getRegisterConsensus(int address, int register) {
+        TIntList addresses = new TIntArrayList(new int[] { address });
+
+        return getRegisterConsensus(addresses, register);
+    }
+
+    public HeapItem getRegisterConsensus(TIntList addressList, int register) {
+        Set<HeapItem> items = new HashSet<HeapItem>();
+        for (int address : addressList.toArray()) {
+            items.addAll(getRegisterItems(address, register));
+            if (items.size() == 0) {
+                // TODO: hack for throw not implemented correctly
+                continue;
+            }
+
+            // Size may be 0 if there was an exception
+            if (items.size() != 1) {
+                if (log.isTraceEnabled()) {
+                    log.trace("No conensus for register #" + register + ", returning unknown");
+                }
+                HeapItem item = items.toArray(new HeapItem[items.size()])[0];
+
+                return HeapItem.newUnknown(item.getType());
             }
         }
 
-        return result;
+        return items.toArray(new HeapItem[1])[0];
     }
 
-    public ExecutionNode getTemplateNode(int address) {
-        return addressToNodePile.get(address).get(TEMPLATE_NODE_INDEX);
+    public Object getRegisterConsensusValue(int address, int register) {
+        HeapItem item = getRegisterConsensus(address, register);
+        if (null == item) {
+            return null;
+        }
+
+        return item.getValue();
     }
 
-    public Object getTerminatingFieldConsensus(String fieldDescriptor) {
-        Map<String, Object> values = getTerminatingFieldConsensus(new String[] { fieldDescriptor });
+    public Object getRegisterConsensusValue(TIntList addressList, int register) {
+        HeapItem item = getRegisterConsensus(addressList, register);
+        if (null == item) {
+            return null;
+        }
 
-        return values.get(fieldDescriptor);
+        return item.getValue();
     }
 
-    public Map<String, Object> getTerminatingFieldConsensus(String[] fieldDescriptors) {
+    public Set<HeapItem> getRegisterItems(int address, int register) {
+        List<ExecutionNode> nodePile = getNodePile(address);
+        Set<HeapItem> items = new HashSet<HeapItem>(nodePile.size());
+        for (ExecutionNode node : nodePile) {
+            MethodState mState = node.getContext().getMethodState();
+            HeapItem item = mState.peekRegister(register);
+            if (item == null) {
+                // If getting terminating register consensus, this may include THROW ops
+                // Since they're not implemented, the return value is NULL
+                // It's also possible there was an exception during invocation.
+                // It could also be return-void
+                // Or it could just be caller is getting register consensus of weird address
+                // assert node.getExceptions().size() > 0 || node.getOp().getInstruction().getOpcode() ==
+                // org.jf.dexlib2.Opcode.THROW;
+                // TODO: handle THROW properly
+            } else {
+                items.add(item);
+            }
+        }
+
+        return items;
+    }
+
+    public ExecutionNode getRoot() {
+        List<ExecutionNode> pile = getNodePileByAddress(METHOD_ROOT_ADDRESS);
+        // Return node with initialized context if available.
+        if (pile.size() > 1) {
+            return pile.get(1);
+        } else {
+            return pile.get(TEMPLATE_NODE_INDEX);
+        }
+    }
+
+    public @Nullable ExecutionNode getTemplateNode(int address) {
+        List<ExecutionNode> nodePile = getNodePileByAddress(address);
+
+        return nodePile.get(TEMPLATE_NODE_INDEX);
+    }
+
+    public List<ExecutionContext> getTerminatingContexts() {
+        List<ExecutionContext> contexts = new LinkedList<ExecutionContext>();
         TIntList addresses = getConnectedTerminatingAddresses();
-        Map<String, Object> result = new HashMap<String, Object>(fieldDescriptors.length);
+        for (int address : addresses.toArray()) {
+            for (ExecutionNode node : getNodePile(address)) {
+                contexts.add(node.getContext());
+            }
+        }
+
+        return contexts;
+    }
+
+    public HeapItem getTerminatingFieldConsensus(String fieldDescriptor) {
+        Map<String, HeapItem> items = getTerminatingFieldConsensus(new String[] { fieldDescriptor });
+
+        return items.get(fieldDescriptor);
+    }
+
+    public Map<String, HeapItem> getTerminatingFieldConsensus(String[] fieldDescriptors) {
+        TIntList addresses = getConnectedTerminatingAddresses();
+        Map<String, HeapItem> result = new HashMap<String, HeapItem>(fieldDescriptors.length);
         for (String fieldDescriptor : fieldDescriptors) {
-            Object value = getFieldConsensus(addresses, fieldDescriptor);
-            result.put(fieldDescriptor, value);
+            HeapItem item = getFieldConsensus(addresses, fieldDescriptor);
+            result.put(fieldDescriptor, item);
         }
 
         return result;
     }
 
-    public Object getTerminatingRegisterConsensus(int register) {
-        Map<Integer, Object> values = getTerminatingRegisterConsensus(new int[] { register });
+    public HeapItem getTerminatingRegisterConsensus(int register) {
+        Map<Integer, HeapItem> items = getTerminatingRegisterConsensus(new int[] { register });
 
-        return values.get(register);
+        return items.get(register);
     }
 
-    public Map<Integer, Object> getTerminatingRegisterConsensus(int[] registers) {
+    public Map<Integer, HeapItem> getTerminatingRegisterConsensus(int[] registers) {
         TIntList addresses = getConnectedTerminatingAddresses();
-        Map<Integer, Object> result = new HashMap<Integer, Object>(registers.length);
+        Map<Integer, HeapItem> result = new HashMap<Integer, HeapItem>(registers.length);
         for (int register : registers) {
-            Object value = getRegisterConsensus(addresses, register);
-            result.put(register, value);
+            HeapItem item = getRegisterConsensus(addresses, register);
+            result.put(register, item);
         }
 
         return result;
@@ -372,11 +465,13 @@ public class ExecutionGraph implements Iterable<ExecutionNode> {
         }
 
         // If this address was reached during execution there will be clones in the pile.
-        List<ExecutionNode> nodePile = addressToNodePile.get(address);
-        if (1 > nodePile.size()) {
+        List<ExecutionNode> nodePile = getNodePileByAddress(address);
+        if ((nodePile == null) || (1 > nodePile.size())) {
             log.warn("Node pile @" + address + " has no template node.");
+            return false;
         }
 
         return nodePile.size() > 1;
     }
+
 }

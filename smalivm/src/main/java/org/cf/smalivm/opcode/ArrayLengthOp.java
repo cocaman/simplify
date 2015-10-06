@@ -1,58 +1,55 @@
 package org.cf.smalivm.opcode;
 
 import java.lang.reflect.Array;
+
+import org.cf.smalivm.VirtualException;
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
+import org.cf.smalivm.context.MethodState;
+import org.cf.smalivm.type.UnknownValue;
+import org.jf.dexlib2.builder.MethodLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.cf.smalivm.context.MethodState;
-import org.cf.smalivm.type.UnknownValue;
-import org.jf.dexlib2.iface.instruction.Instruction;
-import org.jf.dexlib2.iface.instruction.formats.Instruction12x;
-
 public class ArrayLengthOp extends MethodStateOp {
 
-    @SuppressWarnings("unused")
     private static final Logger log = LoggerFactory.getLogger(ArrayLengthOp.class.getSimpleName());
-
-    static ArrayLengthOp create(Instruction instruction, int address) {
-        String opName = instruction.getOpcode().name;
-        int childAddress = address + instruction.getCodeUnits();
-
-        Instruction12x instr = (Instruction12x) instruction;
-        int destRegister = instr.getRegisterA();
-        int arrayRegister = instr.getRegisterB();
-
-        return new ArrayLengthOp(address, opName, childAddress, destRegister, arrayRegister);
-    }
 
     private final int arrayRegister;
     private final int destRegister;
 
-    public ArrayLengthOp(int address, String opName, int childAddress, int valueRegister, int arrayRegister) {
-        super(address, opName, childAddress);
+    ArrayLengthOp(MethodLocation location, MethodLocation child, int valueRegister, int arrayRegister) {
+        super(location, child);
 
-        this.destRegister = valueRegister;
+        destRegister = valueRegister;
         this.arrayRegister = arrayRegister;
+
+        addException(new VirtualException(NullPointerException.class, "Attempt to get length of null array"));
     }
 
     @Override
-    public int[] execute(MethodState mState) {
-        Object array = mState.readRegister(arrayRegister);
-        Object value = null;
-        if (array instanceof UnknownValue) {
-            value = new UnknownValue("I");
-        } else if (array.getClass().isArray()) {
-            value = Array.getLength(array);
+    public void execute(ExecutionNode node, MethodState mState) {
+        HeapItem arrayItem = mState.readRegister(arrayRegister);
+        Object array = arrayItem.getValue();
+        Object lengthValue = null;
+        if (arrayItem.isUnknown()) {
+            lengthValue = new UnknownValue();
+        } else if (array != null && array.getClass().isArray()) {
+            lengthValue = Array.getLength(array);
+            node.clearExceptions();
         } else {
             if (array == null) {
-                log.warn("Unexpected null array for array-length");
+                node.setExceptions(getExceptions());
+                node.clearChildren();
+                return;
             } else {
-                log.warn("Unexpected non-array class: " + array.getClass() + ", " + array);
+                // Won't pass verifier if it's not an array type. Probably our fault, so error.
+                if (log.isErrorEnabled()) {
+                    log.error("Unexpected non-array class: {}, {}", array.getClass(), array);
+                }
             }
         }
-        mState.assignRegister(destRegister, value);
-
-        return getPossibleChildren();
+        mState.assignRegister(destRegister, lengthValue, "I");
     }
 
     @Override

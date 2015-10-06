@@ -1,33 +1,51 @@
 package org.cf.smalivm.opcode;
 
+import java.util.HashSet;
+import java.util.Set;
+
 import org.cf.smalivm.SideEffect;
+import org.cf.smalivm.VirtualException;
+import org.jf.dexlib2.builder.BuilderInstruction;
+import org.jf.dexlib2.builder.MethodLocation;
 
 public abstract class Op {
 
-    private final int address;
-    private final int[] childAddresses;
-    private final String opName;
+    private final MethodLocation location;
+    private final MethodLocation[] children;
+    private final Set<VirtualException> exceptions;
 
-    Op(int address, String opName, int childAddress) {
-        this(address, opName, new int[] { childAddress });
+    Op(MethodLocation location, MethodLocation child) {
+        this(location, new MethodLocation[] { child });
     }
 
-    Op(int address, String opName, int[] childAddresses) {
-        this.address = address;
-        this.opName = opName;
-        this.childAddresses = childAddresses;
+    Op(MethodLocation location, MethodLocation[] children) {
+        this.location = location;
+        this.children = children;
+        exceptions = new HashSet<VirtualException>();
     }
 
     public final int getAddress() {
-        return address;
+        return location.getCodeAddress();
+    }
+
+    public final MethodLocation[] getChildren() {
+        return children;
+    }
+
+    public Set<VirtualException> getExceptions() {
+        return exceptions;
+    }
+
+    public final BuilderInstruction getInstruction() {
+        return (BuilderInstruction) location.getInstruction();
+    }
+
+    public final MethodLocation getLocation() {
+        return location;
     }
 
     public final String getName() {
-        return opName;
-    }
-
-    public final int[] getPossibleChildren() {
-        return childAddresses;
+        return getInstruction().getOpcode().name;
     }
 
     public SideEffect.Level sideEffectLevel() {
@@ -36,5 +54,9 @@ public abstract class Op {
 
     @Override
     public abstract String toString();
+
+    void addException(VirtualException exception) {
+        exceptions.add(exception);
+    }
 
 }

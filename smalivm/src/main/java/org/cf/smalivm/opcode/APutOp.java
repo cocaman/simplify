@@ -1,82 +1,138 @@
 package org.cf.smalivm.opcode;
 
 import java.lang.reflect.Array;
+
+import org.cf.smalivm.ClassManager;
+import org.cf.smalivm.VirtualException;
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
+import org.cf.smalivm.context.MethodState;
+import org.cf.smalivm.exception.UnknownAncestors;
+import org.cf.util.SmaliClassUtils;
+import org.cf.util.Utils;
+import org.jf.dexlib2.builder.MethodLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.cf.smalivm.context.MethodState;
-import org.cf.smalivm.type.UnknownValue;
-import org.jf.dexlib2.iface.instruction.Instruction;
-import org.jf.dexlib2.iface.instruction.formats.Instruction23x;
-
 public class APutOp extends MethodStateOp {
 
-    @SuppressWarnings("unused")
     private static final Logger log = LoggerFactory.getLogger(APutOp.class.getSimpleName());
 
-    static APutOp create(Instruction instruction, int address) {
-        String opName = instruction.getOpcode().name;
-        int childAddress = address + instruction.getCodeUnits();
+    private static Object castValue(String opName, Object value) {
+        if (value instanceof Number) {
+            if (opName.endsWith("-wide")) {
+                // No need to cast anything
+            } else if (opName.endsWith("-boolean")) {
+                // Booleans are represented by integer literals, so need to convert
+                Integer intValue = Utils.getIntegerValue(value);
+                value = intValue == 1 ? true : false;
+            } else {
+                Integer intValue = Utils.getIntegerValue(value);
+                if (opName.endsWith("-byte")) {
+                    value = intValue.byteValue();
+                } else if (opName.endsWith("-char")) {
+                    // Characters, like boolean, are represented by integers
+                    value = (char) intValue.intValue();
+                } else if (opName.endsWith("-short")) {
+                    value = intValue.shortValue();
+                }
+            }
+        }
 
-        Instruction23x instr = (Instruction23x) instruction;
-        int valueRegister = instr.getRegisterA();
-        int arrayRegister = instr.getRegisterB();
-        int indexRegister = instr.getRegisterC();
+        return value;
+    }
 
-        return new APutOp(address, opName, childAddress, valueRegister, arrayRegister, indexRegister);
+    private static boolean isOverloadedPrimitiveType(String type) {
+        return SmaliClassUtils.isPrimitiveType(type) && !("F".equals(type) || "D".equals(type) || "J".equals(type));
+    }
+
+    private static boolean throwsArrayStoreException(ClassManager classManager, String arrayType, String valueType) {
+        String arrayComponentType = SmaliClassUtils.getComponentType(arrayType);
+        // These types are all represented identically in bytecode: Z B C S I
+        if (isOverloadedPrimitiveType(valueType) && isOverloadedPrimitiveType(arrayComponentType)) {
+            // TODO: figure out what dalvik actually does when you try to aput 0x2 into [B
+            // also try to find other edge cases, like Integer.MAX_VALUE in [S
+            return false;
+        }
+
+        try {
+            return !classManager.isInstance(valueType, arrayComponentType);
+        } catch (UnknownAncestors e) {
+            if (log.isWarnEnabled()) {
+                log.warn("Unknown ancestors for either {} or {}", valueType, arrayComponentType);
+            }
+            return true;
+        }
     }
 
     private final int arrayRegister;
+
     private final int indexRegister;
 
     private final int valueRegister;
 
-    public APutOp(int address, String opName, int childAddress, int valueRegister, int arrayRegister, int indexRegister) {
-        super(address, opName, childAddress);
+    private final ClassManager classManager;
 
-        this.valueRegister = valueRegister;
+    public APutOp(MethodLocation location, MethodLocation child, int putRegister, int arrayRegister, int indexRegister,
+                    ClassManager classManager) {
+        super(location, child);
+
+        valueRegister = putRegister;
         this.arrayRegister = arrayRegister;
         this.indexRegister = indexRegister;
+        this.classManager = classManager;
+
+        addException(new VirtualException(ArrayIndexOutOfBoundsException.class));
+        addException(new VirtualException(NullPointerException.class));
     }
 
     @Override
-    public int[] execute(MethodState mState) {
-        Object value = mState.readRegister(valueRegister);
-        Object array = mState.readRegister(arrayRegister);
-        Object indexValue = mState.readRegister(indexRegister);
+    public void execute(ExecutionNode node, MethodState mState) {
+        HeapItem valueItem = mState.readRegister(valueRegister);
+        HeapItem arrayItem = mState.readRegister(arrayRegister);
+        HeapItem indexItem = mState.readRegister(indexRegister);
 
-        // TODO: Adding unknown elements to arrays is very pessimistic. If the value is not known, the entire array
-        // becomes unknown. It's much better (though much harder) to keep track of individual unknown elements. This
-        // requires more robust and complex array handling. After this thing moves past proof of concept, please fix,
-        // future me.
-        if (array instanceof UnknownValue) {
-            // Do nothing. :(
+        boolean throwsStoreException = throwsArrayStoreException(classManager, arrayItem.getType(), valueItem.getType());
+        if (throwsStoreException) {
+            String storeType = SmaliClassUtils.smaliClassToJava(valueItem.getType());
+            node.setException(new VirtualException(ArrayStoreException.class, storeType));
+            node.clearChildren();
+            return;
+        }
+
+        // TODO: https://github.com/CalebFenton/simplify/issues/21
+        // TODO: exceptions should probably have string context
+        // TODO: for all exception handling ops, if ambiguous, need to throw all possible exceptions
+        if (arrayItem.isUnknown()) {
+            // Do nothing.
         } else {
-            if ((value instanceof UnknownValue) || (indexValue instanceof UnknownValue)) {
-                String type = array.getClass().getName();
-                array = new UnknownValue(type);
+            if (valueItem.isUnknown() || indexItem.isUnknown()) {
+                String type = arrayItem.getType();
+                arrayItem = HeapItem.newUnknown(type);
             } else {
-                if (getName().endsWith("-wide")) {
-                    value = (long) value;
-                } else if (getName().endsWith("-boolean")) {
-                    value = ((int) value == 1 ? true : false);
-                } else if (getName().endsWith("-byte")) {
-                    value = (byte) value;
-                } else if (getName().endsWith("-char")) {
-                    value = (char) ((int) value);
-                } else if (getName().endsWith("-short")) {
-                    value = (short) ((int) value);
+                Object array = arrayItem.getValue();
+                if (null == array) {
+                    node.setException(new VirtualException(NullPointerException.class));
+                    node.clearChildren();
+                    return;
                 }
 
-                int index = (int) indexValue;
-                Array.set(array, index, value);
+                int index = indexItem.getIntegerValue();
+                if (index >= Array.getLength(array)) {
+                    node.setException(new VirtualException(ArrayIndexOutOfBoundsException.class));
+                    node.clearChildren();
+                    return;
+                } else {
+                    Object value = castValue(getName(), valueItem.getValue());
+                    Array.set(array, index, value);
+                    node.clearExceptions();
+                }
             }
         }
 
-        // Let the optimizer know the array was modified.
-        mState.assignRegister(arrayRegister, array);
-
-        return getPossibleChildren();
+        // In most cases, register assignment means the old value was blown away.
+        // The optimizer handles assignments for this op specially.
+        mState.assignRegister(arrayRegister, arrayItem);
     }
 
     @Override

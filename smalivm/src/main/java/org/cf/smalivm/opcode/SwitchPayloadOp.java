@@ -1,117 +1,90 @@
 package org.cf.smalivm.opcode;
 
-import gnu.trove.set.TIntSet;
-import gnu.trove.set.hash.TIntHashSet;
+import gnu.trove.map.TIntIntMap;
+import gnu.trove.map.TIntObjectMap;
 
+import java.util.LinkedList;
 import java.util.List;
+
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
+import org.cf.smalivm.context.MethodState;
+import org.cf.util.Utils;
+import org.jf.dexlib2.builder.MethodLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.cf.smalivm.context.MethodState;
-import org.cf.smalivm.type.UnknownValue;
-import org.jf.dexlib2.iface.instruction.Instruction;
-import org.jf.dexlib2.iface.instruction.SwitchElement;
-import org.jf.dexlib2.iface.instruction.SwitchPayload;
-
 public class SwitchPayloadOp extends MethodStateOp {
 
-    private static enum SwitchType {
-        PACKED,
-        SPARSE
+    static enum SwitchType {
+        PACKED, SPARSE
     }
 
     @SuppressWarnings("unused")
     private static final Logger log = LoggerFactory.getLogger(SwitchPayloadOp.class.getSimpleName());
 
     private static final int SWITCH_OP_CODE_UNITS = 3;
+    private final TIntObjectMap<MethodLocation> addressToLocation;
+    private final TIntIntMap targetKeyToOffset;
 
-    private static int[] determineChildren(List<? extends SwitchElement> switchElements) {
-        TIntSet children = new TIntHashSet(switchElements.size() + 1);
-        // Switch ops are CAN_CONTINUE and may "fall through". Add immediate op.
-        children.add(SWITCH_OP_CODE_UNITS);
-        for (int i = 0; i < switchElements.size(); i++) {
-            int offset = switchElements.get(i).getOffset();
-            children.add(offset);
-        }
+    SwitchPayloadOp(MethodLocation location, TIntObjectMap<MethodLocation> addressToLocation,
+                    TIntIntMap targetKeyToOffset) {
+        // Don't know children until we know the pseudo return instruction, only branch offsets
+        super(location);
 
-        return children.toArray();
-    }
-
-    static SwitchPayloadOp create(Instruction instruction, int address) {
-        String opName = instruction.getOpcode().name;
-        SwitchType switchType = null;
-        if (opName.startsWith("packed-")) {
-            switchType = SwitchType.PACKED;
-        } else {
-            switchType = SwitchType.SPARSE;
-        }
-        SwitchPayload instr = (SwitchPayload) instruction;
-        List<? extends SwitchElement> switchElements = instr.getSwitchElements();
-
-        return new SwitchPayloadOp(address, opName, switchType, switchElements);
-    }
-
-    private final List<? extends SwitchElement> switchElements;
-    private final SwitchType switchType;
-
-    private SwitchPayloadOp(int address, String opName, SwitchType switchType,
-                    List<? extends SwitchElement> switchElements) {
-        super(address, opName, determineChildren(switchElements));
-
-        this.switchType = switchType;
-        this.switchElements = switchElements;
+        this.targetKeyToOffset = targetKeyToOffset;
+        this.addressToLocation = addressToLocation;
     }
 
     @Override
-    public int[] execute(MethodState mState) {
-        Object targetValue = mState.readResultRegister();
+    public void execute(ExecutionNode node, MethodState mState) {
         // Pseudo points to instruction *after* switch op.
-        int switchOpAddress = mState.getPseudoInstructionReturnAddress() - SWITCH_OP_CODE_UNITS;
+        MethodLocation returnLocation = mState.getPseudoInstructionReturnInstruction();
+        int branchFromAddress = returnLocation.getCodeAddress() - SWITCH_OP_CODE_UNITS;
 
-        if (targetValue instanceof UnknownValue) {
-            int[] children = getTargetAddresses(switchOpAddress, getPossibleChildren());
-
-            return children;
+        HeapItem targetItem = mState.readResultRegister();
+        if (targetItem.isUnknown()) {
+            List<MethodLocation> childList = getTargets(branchFromAddress, targetKeyToOffset);
+            childList.add(returnLocation);
+            MethodLocation[] children = childList.toArray(new MethodLocation[childList.size()]);
+            node.setChildLocations(children);
+            return;
         }
 
-        int targetKey = (Integer) targetValue;
-        for (SwitchElement element : switchElements) {
-            if (element.getKey() == targetKey) {
-                int targetAddress = getTargetAddress(switchOpAddress, element.getOffset());
-
-                return new int[] { targetAddress };
-            }
+        int targetKey = Utils.getIntegerValue(targetItem.getValue());
+        if (targetKeyToOffset.containsKey(targetKey)) {
+            int targetOffset = branchFromAddress + targetKeyToOffset.get(targetKey);
+            MethodLocation child = addressToLocation.get(targetOffset);
+            node.setChildLocations(child);
+            return;
         }
 
         // Branch target is unspecified. Continue to next op.
-        return new int[] { mState.getPseudoInstructionReturnAddress() };
+        node.setChildLocations(returnLocation);
     }
 
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder(getName());
         sb.append(" [");
-        for (SwitchElement element : switchElements) {
-            sb.append(element.getKey()).append(" -> #").append(element.getOffset()).append(", ");
+        for (int key : targetKeyToOffset.keys()) {
+            int offset = targetKeyToOffset.get(key);
+            sb.append(key).append(" -> #").append(offset).append(", ");
         }
         sb.setLength(sb.length() - 2);
-        sb.append("]");
+        sb.append(']');
 
         return sb.toString();
     }
 
-    private int getTargetAddress(int switchOpAddress, int offset) {
-        // Offsets are from switch op's address.
-        return switchOpAddress + offset;
-    }
-
-    private int[] getTargetAddresses(int switchOpAddress, int[] offsets) {
-        int[] result = new int[offsets.length];
-        for (int i = 0; i < result.length; i++) {
-            result[i] = getTargetAddress(switchOpAddress, offsets[i]);
+    private List<MethodLocation> getTargets(int branchFromAddress, TIntIntMap targetKeyToOffset) {
+        int[] offsets = targetKeyToOffset.values();
+        List<MethodLocation> targets = new LinkedList<MethodLocation>();
+        for (int i = 0; i < offsets.length; i++) {
+            int targetOffset = branchFromAddress + offsets[i];
+            targets.add(addressToLocation.get(targetOffset));
         }
 
-        return result;
+        return targets;
     }
-
 }

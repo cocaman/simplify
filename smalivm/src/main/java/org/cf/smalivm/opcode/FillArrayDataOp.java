@@ -1,53 +1,38 @@
 package org.cf.smalivm.opcode;
 
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
 import org.cf.smalivm.context.MethodState;
-import org.jf.dexlib2.iface.instruction.Instruction;
-import org.jf.dexlib2.iface.instruction.OffsetInstruction;
-import org.jf.dexlib2.iface.instruction.formats.Instruction31t;
+import org.jf.dexlib2.builder.MethodLocation;
 
 public class FillArrayDataOp extends MethodStateOp {
 
-    static FillArrayDataOp create(Instruction instruction, int address) {
-        String opName = instruction.getOpcode().name;
-        int returnAddress = address + instruction.getCodeUnits();
-        int branchOffset = ((OffsetInstruction) instruction).getCodeOffset();
-        int childAddress = address + branchOffset;
-
-        Instruction31t instr = (Instruction31t) instruction;
-        int register = instr.getRegisterA();
-
-        return new FillArrayDataOp(address, opName, childAddress, returnAddress, register);
-    }
-
     private final int register;
-    private final int returnAddress;
+    private final MethodLocation returnLocation;
 
-    private FillArrayDataOp(int address, String opName, int childAddress, int returnAddress, int register) {
-        super(address, opName, childAddress);
+    FillArrayDataOp(MethodLocation location, MethodLocation child, MethodLocation returnLocation, int register) {
+        super(location, child);
 
-        this.returnAddress = returnAddress;
+        this.returnLocation = returnLocation;
         this.register = register;
     }
 
     @Override
-    public int[] execute(MethodState mState) {
-        Object value = mState.readRegister(register);
+    public void execute(ExecutionNode node, MethodState mState) {
+        HeapItem item = mState.readRegister(register);
 
-        // Payload handler will look at its parent (this op) and determine the
-        // target register by looking at what's assigned here.
-        mState.assignRegister(register, value);
+        // Mark register as assigned because next op will be payload, and it uses assigned register in this op to
+        // determine target register for payload.
+        mState.assignRegister(register, item);
 
-        // But it still needs to know the return address when it's done.
-        mState.setPseudoInstructionReturnAddress(returnAddress);
-
-        return getPossibleChildren();
+        // It needs to know return address when finished since payload ops do not continue to next address.
+        mState.setPseudoInstructionReturnLocation(returnLocation);
     }
 
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder(getName());
-
-        sb.append(" r").append(register).append(", #").append(getPossibleChildren()[0]);
+        sb.append(" r").append(register).append(", #").append(getChildren()[0].getCodeAddress());
 
         return sb.toString();
     }

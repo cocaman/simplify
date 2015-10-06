@@ -1,10 +1,16 @@
+apply plugin: 'idea'
+
+version = '0.8.0'
+def jarVersion = version
+
 buildscript {
     repositories {
+        mavenCentral()
         jcenter()
     }
 
     dependencies {
-        classpath 'com.github.jengelman.gradle.plugins:shadow:1.0.3'
+        classpath 'org.kt3k.gradle.plugin:coveralls-gradle-plugin:2.4.0'
     }
 }
 
@@ -15,41 +21,79 @@ allprojects {
     }
 
     apply plugin: 'jacoco'
-    apply plugin: 'idea'
+    apply plugin: 'com.github.kt3k.coveralls'
 }
 
 subprojects {
-    group = 'org.cf'
-
     apply plugin: 'java'
     apply plugin: 'eclipse'
-    apply plugin: 'com.github.johnrengelman.shadow'
+    apply plugin: 'idea'
+
+    group = 'org.cf'
+    sourceCompatibility = 1.7
+    version = parent.version
+
+    jar {
+        version = jarVersion
+    }
+
+    ext {
+        depends = [
+            args4j: 'args4j:args4j:2.32',
+            commons_io: 'commons-io:commons-io:2.4',
+            commons_lang: 'org.apache.commons:commons-lang3:3.4',
+            findbugs: 'com.google.code.findbugs:jsr305:1.3.9',
+            guava: 'com.google.guava:guava:18.0',
+            junit: 'junit:junit:4.12',
+            mockito: 'org.mockito:mockito-core:1.10.19',
+            perfidix: 'org.perfidix:perfidix:3.6.9',
+            proguard_gradle: 'net.sf.proguard:proguard-gradle:5.2.1',
+            slf4j_api: 'org.slf4j:slf4j-api:1.7.12',
+            trove4j: 'net.sf.trove4j:trove4j:3.0.3',
+         ]
+    }
+
+    // This is just to show off API usage. No tests needed.
+    if (!project.name.equals("demoapp")) {
+        jacocoTestReport {
+            reports {
+                html.enabled = true
+                xml.enabled = true
+                csv.enabled = false
+            }
+        }
+    }
 }
 
-// Thanks https://csiebler.github.io/blog/2014/02/09/multi-project-code-coverage-using-gradle-and-jacoco/
-task codeCoverageReport(type: JacocoReport) {
-    // Gather execution data from all subprojects
-    // (change this if you e.g. want to calculate unit test/integration test coverage separately)
-    executionData fileTree(project.rootDir.absolutePath).include("**/build/jacoco/*.exec")
+coveralls {
+    sourceDirs = files(subprojects.sourceSets.main.allSource.srcDirs).files.absolutePath
+}
 
-    // Add all relevant sourcesets from the subprojects
-    subprojects.each {
-       sourceSets it.sourceSets.main
-    }
+task jacocoTestReport(type: org.gradle.testing.jacoco.tasks.JacocoReport) {
+    ext.targetProjects = subprojects - project(':demoapp')
+
+    dependsOn = ext.targetProjects.test
+    sourceDirectories = files(ext.targetProjects.sourceSets.main.allSource.srcDirs)
+    classDirectories = files(ext.targetProjects.sourceSets.main.output)
+    executionData = files(ext.targetProjects.jacocoTestReport.executionData)
 
     reports {
-        xml.enabled true
-        html.enabled true
-        html.destination "${buildDir}/reports/jacoco"
-        csv.enabled false
+        html.enabled = true
+        xml.enabled = true
+        csv.enabled = false
     }
-}
 
-// always run the tests before generating the report
-codeCoverageReport.dependsOn {
-    subprojects*.test
+    onlyIf = {
+        true
+    }
+
+    doFirst {
+        executionData = files(executionData.findAll {
+            it.exists()
+        })
+    }
 }
 
 task wrapper(type: Wrapper) {
-    gradleVersion = '2.0'
+    gradleVersion = '2.7'
 }

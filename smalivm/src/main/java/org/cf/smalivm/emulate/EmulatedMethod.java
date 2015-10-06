@@ -1,12 +1,14 @@
 package org.cf.smalivm.emulate;
 
+import java.util.Set;
+
 import org.cf.smalivm.SideEffect.Level;
-import org.cf.smalivm.context.MethodState;
+import org.cf.smalivm.VirtualException;
 
 public interface EmulatedMethod {
 
-    public void execute(MethodState mState) throws Exception;
-
     public Level getSideEffectLevel();
+
+    public Set<VirtualException> getExceptions();
 
 }

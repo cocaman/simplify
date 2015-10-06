@@ -1,7 +1,14 @@
 package org.cf.smalivm;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 import gnu.trove.list.TIntList;
 import gnu.trove.list.array.TIntArrayList;
 import gnu.trove.map.TIntObjectMap;
@@ -11,17 +18,22 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 
 import org.cf.smalivm.context.ClassState;
 import org.cf.smalivm.context.ExecutionContext;
 import org.cf.smalivm.context.ExecutionGraph;
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
 import org.cf.smalivm.context.MethodState;
+import org.cf.smalivm.exception.MaxAddressVisitsExceeded;
+import org.cf.smalivm.exception.MaxCallDepthExceeded;
+import org.cf.smalivm.exception.MaxMethodVisitsExceeded;
+import org.cf.smalivm.exception.UnhandledVirtualException;
 import org.cf.smalivm.type.UnknownValue;
 import org.cf.util.Dexifier;
+import org.jf.dexlib2.builder.MethodLocation;
 import org.jf.dexlib2.writer.builder.DexBuilder;
-import org.junit.Assert;
 
 import com.google.common.collect.Sets;
 
@@ -29,84 +41,92 @@ public class VMTester {
 
     private static final String TEST_DIRECTORY = "resources/test";
 
-    private static DexBuilder dexBuilder;
-    private static SmaliClassManager classManager;
+    private static ClassManager classManager;
 
-    public static Map<String, Map<String, Object>> buildClassNameToFieldValue(String className, Object... params) {
-        Map<String, Map<String, Object>> result = new HashMap<String, Map<String, Object>>(1);
-        Map<String, Object> fieldReferenceToValue = new HashMap<String, Object>(params.length / 2);
+    public static Map<String, Map<String, HeapItem>> buildClassNameToFieldItem(String className, Object... params) {
+        Map<String, Map<String, HeapItem>> result = new HashMap<String, Map<String, HeapItem>>(1);
+        Map<String, HeapItem> fieldReferenceToValue = new HashMap<String, HeapItem>(params.length / 2);
         result.put(className, fieldReferenceToValue);
         for (int i = 0; i < params.length; i += 2) {
-            fieldReferenceToValue.put((String) params[i], params[i + 1]);
+            String fieldNameAndType = (String) params[i];
+            String type = fieldNameAndType.split(":")[1];
+            HeapItem item = new HeapItem(params[i + 1], type);
+            fieldReferenceToValue.put(fieldNameAndType, item);
         }
 
         return result;
     }
 
-    public static Map<String, Object> buildFieldToValue(Object... params) {
-        Map<String, Object> result = new HashMap<String, Object>(params.length / 2);
-        for (int i = 0; i < params.length; i += 2) {
-            result.put((String) params[i], params[i + 1]);
+    public static Map<String, HeapItem> buildFieldToValue(Object... params) {
+        Map<String, HeapItem> result = new HashMap<String, HeapItem>(params.length / 3);
+        for (int i = 0; i < params.length; i += 3) {
+            HeapItem item = new HeapItem(params[i + 1], (String) params[i + 2]);
+            result.put((String) params[i], item);
         }
 
         return result;
     }
 
-    public static TIntObjectMap<Object> buildRegisterState(Object... params) {
-        TIntObjectMap<Object> result = new TIntObjectHashMap<Object>();
-        for (int i = 0; i < params.length; i += 2) {
-            result.put((int) params[i], params[i + 1]);
+    public static TIntObjectMap<HeapItem> buildRegisterState(Object... params) {
+        TIntObjectMap<HeapItem> result = new TIntObjectHashMap<HeapItem>();
+        for (int i = 0; i < params.length; i += 3) {
+            HeapItem item = new HeapItem(params[i + 1], (String) params[i + 2]);
+            result.put((int) params[i], item);
         }
 
         return result;
     }
 
     public static ExecutionGraph execute(String className, String methodSignature) {
-        return execute(className, methodSignature, new TIntObjectHashMap<Object>(),
-                        new HashMap<String, Map<String, Object>>(0));
+        return execute(className, methodSignature, new TIntObjectHashMap<HeapItem>(),
+                        new HashMap<String, Map<String, HeapItem>>(0));
     }
 
     public static ExecutionGraph execute(String className, String methodSignature,
-                    TIntObjectMap<Object> initialRegisterToValue) {
-        return execute(className, methodSignature, initialRegisterToValue, new HashMap<String, Map<String, Object>>(0));
+                    TIntObjectMap<HeapItem> initialRegisterToItem) {
+        return execute(className, methodSignature, initialRegisterToItem, new HashMap<String, Map<String, HeapItem>>(0));
     }
 
     public static ExecutionGraph execute(String className, String methodSignature,
-                    TIntObjectMap<Object> registerToValue, Map<String, Map<String, Object>> classNameToFieldValue) {
-        return execute(className, methodSignature, registerToValue, classNameToFieldValue, Sets.newHashSet(className));
+                    TIntObjectMap<HeapItem> registerToItem, Map<String, Map<String, HeapItem>> classNameToFieldItem) {
+        return execute(className, methodSignature, registerToItem, classNameToFieldItem, Sets.newHashSet(className));
     }
 
     public static ExecutionGraph execute(String className, String methodSignature,
-                    TIntObjectMap<Object> registerToValue, Map<String, Map<String, Object>> classNameToFieldValue,
+                    TIntObjectMap<HeapItem> registerToItem, Map<String, Map<String, HeapItem>> classNameToFieldItem,
                     Set<String> classNamesToStaticInit) {
         VirtualMachine vm = getTestVM();
 
-        return execute(vm, className, methodSignature, registerToValue, classNameToFieldValue);
+        return execute(vm, className, methodSignature, registerToItem, classNameToFieldItem);
     }
 
     public static ExecutionGraph execute(VirtualMachine vm, String className, String methodSignature,
-                    TIntObjectMap<Object> registerToValue, Map<String, Map<String, Object>> classNameToFieldValue) {
+                    TIntObjectMap<HeapItem> registerToItem, Map<String, Map<String, HeapItem>> classNameToFieldItem) {
         String methodDescriptor = className + "->" + methodSignature;
-        ExecutionContext ectx = getInitializedExecutionContext(vm, methodDescriptor, registerToValue,
-                        classNameToFieldValue);
-        ExecutionGraph graph = vm.execute(methodDescriptor, ectx);
+        ExecutionContext ectx = getInitializedContext(vm, methodDescriptor, registerToItem, classNameToFieldItem);
+        ExecutionGraph graph = null;
+        try {
+            graph = vm.execute(methodDescriptor, ectx);
+        } catch (MaxAddressVisitsExceeded | MaxCallDepthExceeded | MaxMethodVisitsExceeded | UnhandledVirtualException e) {
+            e.printStackTrace();
+        }
 
         return graph;
     }
 
-    public static SmaliClassManager getClassManager() {
+    public static ClassManager getClassManager() {
         return classManager;
     }
 
     public static DexBuilder getDexBuilder() {
-        return dexBuilder;
+        return DexBuilder.makeDexBuilder(Dexifier.DEFAULT_API_LEVEL);
     }
 
-    public static VirtualMachine getTestVM() {
-        dexBuilder = DexBuilder.makeDexBuilder(Dexifier.DEFAULT_API_LEVEL);
-        if (null == classManager) {
+    public static VirtualMachine getTestVM(boolean reloadClasses) {
+        // Not reloading classes is an optimization to speed up tests
+        if ((null == classManager) || reloadClasses) {
             try {
-                classManager = new SmaliClassManager(TEST_DIRECTORY, dexBuilder);
+                classManager = new ClassManager(TEST_DIRECTORY, getDexBuilder());
             } catch (IOException e) {
                 e.printStackTrace();
                 System.exit(-1);
@@ -116,94 +136,98 @@ public class VMTester {
         return new VirtualMachine(classManager);
     }
 
-    public static void testClassState(String className, String methodSignature,
-                    Map<String, Map<String, Object>> classNameToInitialFieldValue,
-                    Map<String, Map<String, Object>> classNameToExpectedFieldValue) {
-        TIntObjectMap<Object> initialRegisterToValue = new TIntObjectHashMap<Object>();
-        TIntObjectMap<Object> expectedRegisterToValue = new TIntObjectHashMap<Object>();
-        testMethodAndClassState(className, methodSignature, initialRegisterToValue, expectedRegisterToValue,
-                        classNameToInitialFieldValue, classNameToExpectedFieldValue, new HashSet<String>());
+    public static VirtualMachine getTestVM() {
+        return getTestVM(false);
     }
 
     public static void testClassState(String className, String methodSignature,
-                    TIntObjectMap<Object> initialRegisterToValue,
-                    Map<String, Map<String, Object>> classNameToExpectedFieldValue) {
-        TIntObjectMap<Object> expectedRegisterToValue = new TIntObjectHashMap<Object>();
-        Map<String, Map<String, Object>> classNameToInitialFieldValue = new HashMap<String, Map<String, Object>>(0);
-        testMethodAndClassState(className, methodSignature, initialRegisterToValue, expectedRegisterToValue,
-                        classNameToInitialFieldValue, classNameToExpectedFieldValue, new HashSet<String>());
+                    Map<String, Map<String, HeapItem>> classNameToInitialFieldItem,
+                    Map<String, Map<String, HeapItem>> classNameToExpectedFieldItem) {
+        TIntObjectMap<HeapItem> initialRegisterToItem = new TIntObjectHashMap<HeapItem>();
+        TIntObjectMap<HeapItem> expectedRegisterToItem = new TIntObjectHashMap<HeapItem>();
+        testMethodAndClassState(className, methodSignature, initialRegisterToItem, expectedRegisterToItem,
+                        classNameToInitialFieldItem, classNameToExpectedFieldItem, new HashSet<String>());
     }
 
     public static void testClassState(String className, String methodSignature,
-                    TIntObjectMap<Object> initialRegisterToValue,
-                    Map<String, Map<String, Object>> classNameToInitialFieldValue,
-                    Map<String, Map<String, Object>> classNameToExpectedFieldValue) {
-        TIntObjectMap<Object> expectedRegisterToValue = new TIntObjectHashMap<Object>();
-        testMethodAndClassState(className, methodSignature, initialRegisterToValue, expectedRegisterToValue,
-                        classNameToInitialFieldValue, classNameToExpectedFieldValue, new HashSet<String>());
+                    TIntObjectMap<HeapItem> initialRegisterToItem,
+                    Map<String, Map<String, HeapItem>> classNameToExpectedFieldItem) {
+        TIntObjectMap<HeapItem> expectedRegisterToItem = new TIntObjectHashMap<HeapItem>();
+        Map<String, Map<String, HeapItem>> classNameToInitialFieldItem = new HashMap<String, Map<String, HeapItem>>(0);
+        testMethodAndClassState(className, methodSignature, initialRegisterToItem, expectedRegisterToItem,
+                        classNameToInitialFieldItem, classNameToExpectedFieldItem, new HashSet<String>());
+    }
+
+    public static void testClassState(String className, String methodSignature,
+                    TIntObjectMap<HeapItem> initialRegisterToItem,
+                    Map<String, Map<String, HeapItem>> classNameToInitialFieldItem,
+                    Map<String, Map<String, HeapItem>> classNameToExpectedFieldItem) {
+        TIntObjectMap<HeapItem> expectedRegisterToItem = new TIntObjectHashMap<HeapItem>();
+        testMethodAndClassState(className, methodSignature, initialRegisterToItem, expectedRegisterToItem,
+                        classNameToInitialFieldItem, classNameToExpectedFieldItem, new HashSet<String>());
     }
 
     public static void testMethodAndClassState(String className, String methodSignature,
-                    TIntObjectMap<Object> initialRegisterToValue, TIntObjectMap<Object> expectedRegisterToValue,
-                    Map<String, Map<String, Object>> classNameToInitialFieldValue,
-                    Map<String, Map<String, Object>> classNameToExpectedFieldValue,
+                    TIntObjectMap<HeapItem> initialRegisterToItem, TIntObjectMap<HeapItem> expectedRegisterToItem,
+                    Map<String, Map<String, HeapItem>> classNameToInitialFieldItem,
+                    Map<String, Map<String, HeapItem>> classNameToExpectedFieldItem,
                     Set<String> classNamesToMakeAvailable) {
         Set<String> classNames = new HashSet<String>();
         classNames.add(className);
-        classNames.addAll(classNameToInitialFieldValue.keySet());
-        classNames.addAll(classNameToExpectedFieldValue.keySet());
+        classNames.addAll(classNameToInitialFieldItem.keySet());
+        classNames.addAll(classNameToExpectedFieldItem.keySet());
         classNames.addAll(classNamesToMakeAvailable);
-        ExecutionGraph graph = execute(className, methodSignature, initialRegisterToValue,
-                        classNameToInitialFieldValue, classNames);
+        ExecutionGraph graph = execute(className, methodSignature, initialRegisterToItem, classNameToInitialFieldItem,
+                        classNames);
         assertNotNull(graph);
 
-        for (int register : expectedRegisterToValue.keys()) {
-            Object value = expectedRegisterToValue.get(register);
-            Object consensus = graph.getTerminatingRegisterConsensus(register);
+        for (int register : expectedRegisterToItem.keys()) {
+            HeapItem item = expectedRegisterToItem.get(register);
+            HeapItem consensus = graph.getTerminatingRegisterConsensus(register);
 
-            testRegisterEquals(register, value, consensus);
+            testRegisterEquals(register, item, consensus);
         }
 
-        for (String currentClassName : classNameToExpectedFieldValue.keySet()) {
-            Map<String, Object> check = classNameToExpectedFieldValue.get(currentClassName);
+        for (String currentClassName : classNameToExpectedFieldItem.keySet()) {
+            Map<String, HeapItem> check = classNameToExpectedFieldItem.get(currentClassName);
             for (String fieldReference : check.keySet()) {
-                Object checkValue = check.get(fieldReference);
+                HeapItem checkItem = check.get(fieldReference);
                 String fieldDescriptor = currentClassName + "->" + fieldReference;
-                Object actualValue = graph.getTerminatingFieldConsensus(fieldDescriptor);
+                HeapItem actualItem = graph.getTerminatingFieldConsensus(fieldDescriptor);
 
-                testFieldEquals(fieldDescriptor, checkValue, actualValue);
+                testFieldEquals(fieldDescriptor, checkItem, actualItem);
             }
         }
     }
 
     public static void testMethodState(String className, String methodSignature,
-                    TIntObjectMap<Object> expectedRegisterToValue) {
-        testMethodState(className, methodSignature, new TIntObjectHashMap<Object>(), expectedRegisterToValue);
+                    TIntObjectMap<HeapItem> expectedRegisterToItem) {
+        testMethodState(className, methodSignature, new TIntObjectHashMap<HeapItem>(), expectedRegisterToItem);
     }
 
     public static void testMethodState(String className, String methodSignature,
-                    TIntObjectMap<Object> expectedRegisterToValue,
-                    Map<String, Map<String, Object>> classNameToInitialFieldValue) {
-        TIntObjectMap<Object> initialRegisterToValue = new TIntObjectHashMap<Object>();
-        Map<String, Map<String, Object>> classNameToExpectedFieldValue = new HashMap<String, Map<String, Object>>(0);
+                    TIntObjectMap<HeapItem> expectedRegisterToItem,
+                    Map<String, Map<String, HeapItem>> classNameToInitialFieldItem) {
+        TIntObjectMap<HeapItem> initialRegisterToItem = new TIntObjectHashMap<HeapItem>();
+        Map<String, Map<String, HeapItem>> classNameToExpectedFieldItem = new HashMap<String, Map<String, HeapItem>>(0);
 
-        testMethodAndClassState(className, methodSignature, initialRegisterToValue, expectedRegisterToValue,
-                        classNameToInitialFieldValue, classNameToExpectedFieldValue, new HashSet<String>());
+        testMethodAndClassState(className, methodSignature, initialRegisterToItem, expectedRegisterToItem,
+                        classNameToInitialFieldItem, classNameToExpectedFieldItem, new HashSet<String>());
     }
 
     public static void testMethodState(String className, String methodSignature,
-                    TIntObjectMap<Object> initialRegisterToValue, TIntObjectMap<Object> expectedRegisterToValue) {
-        testMethodAndClassState(className, methodSignature, initialRegisterToValue, expectedRegisterToValue,
-                        new HashMap<String, Map<String, Object>>(0), new HashMap<String, Map<String, Object>>(0),
+                    TIntObjectMap<HeapItem> initialRegisterToItem, TIntObjectMap<HeapItem> expectedRegisterToItem) {
+        testMethodAndClassState(className, methodSignature, initialRegisterToItem, expectedRegisterToItem,
+                        new HashMap<String, Map<String, HeapItem>>(0), new HashMap<String, Map<String, HeapItem>>(0),
                         new HashSet<String>());
     }
 
     public static void testVisitation(String className, String methodSignature, int[] expectedVisitations) {
-        testVisitation(className, methodSignature, new TIntObjectHashMap<Object>(), expectedVisitations);
+        testVisitation(className, methodSignature, new TIntObjectHashMap<HeapItem>(), expectedVisitations);
     }
 
     public static void testVisitation(String className, String methodSignature,
-                    TIntObjectMap<Object> initialRegisterToValue, int[] expectedVisitations) {
+                    TIntObjectMap<HeapItem> initialRegisterToValue, int[] expectedVisitations) {
         ExecutionGraph graph = VMTester.execute(className, methodSignature, initialRegisterToValue);
         int[] addresses = graph.getAddresses();
         TIntList expectedVisits = new TIntArrayList(expectedVisitations);
@@ -214,88 +238,122 @@ public class VMTester {
             }
             actualVisits.add(address);
         }
-        // Note: order IS important!
         actualVisits.reverse();
 
         assertEquals(expectedVisits, actualVisits);
     }
 
-    private static String getClassName(Object obj) {
-        String result = "null";
-        if (obj != null) {
-            result = obj.getClass().getName();
-        }
-
-        return result;
-    }
-
-    private static ExecutionContext getInitializedExecutionContext(VirtualMachine vm, String methodDescriptor,
-                    TIntObjectMap<Object> registerToValue, Map<String, Map<String, Object>> classNameToInitialFieldValue) {
-        ExecutionContext ectx = vm.getRootExecutionContext(methodDescriptor);
-        setupMethodState(ectx, registerToValue);
-        setupClassStates(ectx, classNameToInitialFieldValue);
+    private static ExecutionContext getInitializedContext(VirtualMachine vm, String methodDescriptor,
+                    TIntObjectMap<HeapItem> registerToItem,
+                    Map<String, Map<String, HeapItem>> classNameToInitialFieldItem) {
+        ExecutionContext ectx = vm.spawnExecutionContext(methodDescriptor);
+        int registerCount = ectx.getMethodState().getRegisterCount();
+        setupMethodState(ectx, registerToItem, registerCount);
+        setupClassStates(ectx, classNameToInitialFieldItem);
 
         return ectx;
     }
 
-    private static void setupClassStates(ExecutionContext ectx, Map<String, Map<String, Object>> classNameToFieldValue) {
-        for (String className : classNameToFieldValue.keySet()) {
-            Map<String, Object> fieldToValue = classNameToFieldValue.get(className);
+    private static void setupClassStates(ExecutionContext ectx, Map<String, Map<String, HeapItem>> classNameToFieldItem) {
+        for (String className : classNameToFieldItem.keySet()) {
+            Map<String, HeapItem> fieldToItem = classNameToFieldItem.get(className);
             ClassState cState = ectx.peekClassState(className);
-            for (String fieldNameAndType : fieldToValue.keySet()) {
-                Object value = fieldToValue.get(fieldNameAndType);
-                cState.pokeField(fieldNameAndType, value);
+            for (String fieldNameAndType : fieldToItem.keySet()) {
+                HeapItem item = fieldToItem.get(fieldNameAndType);
+                cState.pokeField(fieldNameAndType, item);
             }
             ectx.initializeClass(className, cState, SideEffect.Level.NONE);
         }
     }
 
-    private static void setupMethodState(ExecutionContext ectx, TIntObjectMap<Object> registerToValue) {
-        MethodState mState = new MethodState(ectx, registerToValue.size());
-        for (int register : registerToValue.keys()) {
-            Object value = registerToValue.get(register);
-            mState.assignRegister(register, value);
+    private static void setupMethodState(ExecutionContext ectx, TIntObjectMap<HeapItem> registerToItem,
+                    int registerCount) {
+        MethodState mState = new MethodState(ectx, registerCount);
+        for (int register : registerToItem.keys()) {
+            HeapItem item = registerToItem.get(register);
+            mState.assignRegister(register, item);
         }
         ectx.setMethodState(mState);
     }
 
-    private static void testFieldEquals(String fieldDescriptor, Object value, Object consensus) {
-        StringBuilder sb = new StringBuilder();
-        sb.append(fieldDescriptor).append(" class(expected=").append(getClassName(value)).append(", consensus=")
-        .append(getClassName(consensus)).append(")");
-        String msg = sb.toString();
-
-        testValueEquals(value, consensus, msg);
+    private static void testFieldEquals(String fieldDescriptor, HeapItem item, HeapItem consensus) {
+        testValueEquals(item, consensus);
     }
 
-    private static void testRegisterEquals(int register, Object value, Object consensus) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("r").append(register).append(" class(expected=").append(getClassName(value)).append(", consensus=")
-        .append(getClassName(consensus)).append(")");
-        String msg = sb.toString();
-
-        testValueEquals(value, consensus, msg);
+    private static void testRegisterEquals(int register, HeapItem item, HeapItem consensus) {
+        testValueEquals(item, consensus);
     }
 
-    private static void testValueEquals(Object value, Object consensus, String msg) {
-        if (value != null) {
-            assertNotNull(msg, consensus);
+    private static void testValueEquals(HeapItem expected, HeapItem consensus) {
+        Object expectedValue = expected.getValue();
+        Object consensusValue = consensus.getValue();
+
+        if (expectedValue != null) {
+            assertNotNull(consensusValue);
         }
 
-        if (value == null) {
-            Assert.assertEquals(msg, value, consensus);
-        } else if (value instanceof UnknownValue) {
-            // Only checks type and value
-            Assert.assertEquals(msg, value.toString(), consensus.toString());
-        } else if (value.getClass().isArray()) {
-            // If array, type is "Object", so need to use isArray() instead of instanceof
-            boolean result = Objects.deepEquals(value, consensus);
-            Assert.assertTrue(msg, result);
-        } else if (value instanceof StringBuilder) {
-            assertEquals(msg, value.toString(), consensus.toString());
+        if (expectedValue == null) {
+            assertEquals(expected, consensus);
+        } else if (expected.isUnknown()) {
+            // Normally, unknown doesn't equal anything, including itself, but tests are more relaxed.
+            assertEquals(expected.toString(), consensus.toString());
+        } else if (expectedValue.getClass().isArray()) {
+            assertEquals(expected.getType(), consensus.getType());
+
+            if (expectedValue instanceof Object[] && consensusValue instanceof Object[])
+                assertArrayEquals((Object[]) expectedValue, (Object[]) consensusValue);
+            else if (expectedValue instanceof byte[] && consensusValue instanceof byte[])
+                assertArrayEquals((byte[]) expectedValue, (byte[]) consensusValue);
+            else if (expectedValue instanceof short[] && consensusValue instanceof short[])
+                assertArrayEquals((short[]) expectedValue, (short[]) consensusValue);
+            else if (expectedValue instanceof int[] && consensusValue instanceof int[])
+                assertArrayEquals((int[]) expectedValue, (int[]) consensusValue);
+            else if (expectedValue instanceof long[] && consensusValue instanceof long[])
+                assertArrayEquals((long[]) expectedValue, (long[]) consensusValue);
+            else if (expectedValue instanceof char[] && consensusValue instanceof char[])
+                assertArrayEquals((char[]) expectedValue, (char[]) consensusValue);
+            else if (expectedValue instanceof float[] && consensusValue instanceof float[])
+                assertArrayEquals((float[]) expectedValue, (float[]) consensusValue, 0.001F);
+            else if (expectedValue instanceof double[] && consensusValue instanceof double[])
+                assertArrayEquals((double[]) expectedValue, (double[]) consensusValue, 0.001);
+            else if (expectedValue instanceof boolean[] && consensusValue instanceof boolean[])
+                assertArrayEquals((boolean[]) expectedValue, (boolean[]) consensusValue);
+            else {
+                assertEquals(expectedValue, consensusValue);
+            }
+        } else if (expectedValue instanceof StringBuilder) {
+            assertEquals(expectedValue.toString(), consensusValue.toString());
         } else {
-            Assert.assertEquals(msg, value, consensus);
+            assertEquals(expectedValue, consensusValue);
         }
+    }
+
+    public static void addHeapItem(MethodState mState, int register, Object value, String type) {
+        HeapItem item = mock(HeapItem.class);
+        when(item.getValue()).thenReturn(value);
+        if ("I".equals(type) && value instanceof Number) {
+            when(item.getIntegerValue()).thenReturn((Integer) value);
+        } else if (value instanceof UnknownValue) {
+            when(item.isUnknown()).thenReturn(true);
+        }
+        when(item.getType()).thenReturn(type);
+        when(mState.readRegister(eq(register))).thenReturn(item);
+    }
+
+    public static void verifyExceptionHandling(VirtualException expectedException, ExecutionNode node,
+                    MethodState mState) {
+        verify(node).setException(eq(expectedException));
+        verify(node).clearChildren();
+        verify(node, times(0)).setChildLocations(any(MethodLocation[].class));
+        verify(mState, times(0)).assignRegister(any(Integer.class), any(HeapItem.class));
+    }
+
+    public static void verifyExceptionHandling(Set<VirtualException> expectedExceptions, ExecutionNode node,
+                    MethodState mState) {
+        verify(node).setExceptions(eq(expectedExceptions));
+        verify(node).clearChildren();
+        verify(node, times(0)).setChildLocations(any(MethodLocation[].class));
+        verify(mState, times(0)).assignRegister(any(Integer.class), any(HeapItem.class));
     }
 
 }

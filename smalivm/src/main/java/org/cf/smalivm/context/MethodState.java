@@ -3,17 +3,21 @@ package org.cf.smalivm.context;
 import gnu.trove.set.TIntSet;
 import gnu.trove.set.hash.TIntHashSet;
 
-import org.cf.smalivm.type.TypeUtil;
-import org.cf.util.ImmutableUtils;
-import org.cf.util.SmaliClassUtils;
+import org.cf.util.Utils;
+import org.jf.dexlib2.builder.MethodLocation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class MethodState extends BaseState {
 
+    private static final Logger log = LoggerFactory.getLogger(MethodState.class.getSimpleName());
+
     public static final int ResultRegister = -1;
-    public static final int ReturnAddress = -3;
     public static final int ReturnRegister = -2;
+    public static final int ReturnAddress = -3;
 
     public static final String MUTABLE_PARAMETER_HEAP = "mutable";
+    // TODO: refactor ExecutionContext's method descriptor here, it saves having an extra string * n ops
     public static final String METHOD_HEAP = "method";
 
     private final int parameterCount;
@@ -32,14 +36,6 @@ public class MethodState extends BaseState {
         mutableParameters = new TIntHashSet(parameterCount);
     }
 
-    MethodState(MethodState other, ExecutionContext ectx) {
-        super(other, ectx);
-
-        this.parameterCount = other.parameterCount;
-        this.parameterSize = other.parameterSize;
-        mutableParameters = new TIntHashSet(other.mutableParameters);
-    }
-
     private MethodState(MethodState parent, ExecutionContext ectx, TIntSet mutableParameters) {
         super(parent, ectx);
 
@@ -48,47 +44,61 @@ public class MethodState extends BaseState {
         this.mutableParameters = parent.mutableParameters;
     }
 
-    public void assignParameter(int parameterRegister, Object value) {
-        assignRegister(parameterRegister, value, METHOD_HEAP);
+    MethodState(MethodState other, ExecutionContext ectx) {
+        super(other, ectx);
 
-        String type = TypeUtil.getValueType(value);
-        type = SmaliClassUtils.javaClassToSmali(type);
-        boolean mutable = !ImmutableUtils.isImmutableClass(type);
+        this.parameterCount = other.parameterCount;
+        this.parameterSize = other.parameterSize;
+        mutableParameters = new TIntHashSet(other.mutableParameters);
+    }
+
+    public void assignParameter(int parameterRegister, HeapItem item) {
+        assignRegister(parameterRegister, item, METHOD_HEAP);
+
+        boolean mutable = !item.isImmutable();
         if (mutable) {
-            pokeRegister(parameterRegister, value, MUTABLE_PARAMETER_HEAP);
+            pokeRegister(parameterRegister, item, MUTABLE_PARAMETER_HEAP);
             mutableParameters.add(parameterRegister);
         }
     }
 
-    public void assignRegister(int register, Object value) {
-        super.assignRegister(register, value, METHOD_HEAP);
+    public void assignParameter(int parameterRegister, Object value, String type) {
+        assignParameter(parameterRegister, new HeapItem(value, type));
     }
 
-    public void assignResultRegister(Object value) {
-        assignRegister(ResultRegister, value, METHOD_HEAP);
+    public void assignRegister(int register, HeapItem item) {
+        super.assignRegister(register, item, METHOD_HEAP);
     }
 
-    public void assignReturnRegister(Object value) {
-        pokeRegister(ReturnRegister, value, METHOD_HEAP);
+    public void assignRegister(int register, Object value, String type) {
+        assignRegister(register, new HeapItem(value, type));
     }
 
-    public void pokeRegister(int register, Object value) {
-        super.pokeRegister(register, value, METHOD_HEAP);
+    /**
+     * Identical to {@link #assignRegister(int, HeapItem)} but also updates any register with an identical value to that
+     * stored in the target register with the new value.
+     *
+     * @param register
+     * @param item
+     */
+    public void assignRegisterAndUpdateIdentities(int register, HeapItem item) {
+        super.assignRegisterAndUpdateIdentities(register, item, METHOD_HEAP);
     }
 
-    public Object readRegister(int register) {
-        return super.readRegister(register, METHOD_HEAP);
+    public void assignResultRegister(HeapItem item) {
+        assignRegister(ResultRegister, item, METHOD_HEAP);
     }
 
-    public Object peekParameter(int parameterRegister) {
-        Object value;
-        if (mutableParameters.contains(parameterRegister)) {
-            value = peekRegister(parameterRegister, MUTABLE_PARAMETER_HEAP);
-        } else {
-            value = peekRegister(parameterRegister);
-        }
+    public void assignResultRegister(Object value, String type) {
+        assignRegister(ResultRegister, new HeapItem(value, type));
+    }
 
-        return value;
+    public void assignReturnRegister(HeapItem item) {
+        pokeRegister(ReturnRegister, item, METHOD_HEAP);
+    }
+
+    public void assignReturnRegister(Object value, String type) {
+        pokeRegister(ReturnRegister, new HeapItem(value, type), METHOD_HEAP);
     }
 
     public int getParameterCount() {
@@ -104,29 +114,61 @@ public class MethodState extends BaseState {
         return (MethodState) super.getParent();
     }
 
-    public int getPseudoInstructionReturnAddress() {
-        return (int) peekRegister(ReturnAddress);
+    public MethodLocation getPseudoInstructionReturnInstruction() {
+        return (MethodLocation) peekRegister(ReturnAddress).getValue();
     }
 
-    public Object peekRegister(int register) {
+    public HeapItem peekParameter(int parameterRegister) {
+        HeapItem item;
+        if (mutableParameters.contains(parameterRegister)) {
+            item = peekRegister(parameterRegister, MUTABLE_PARAMETER_HEAP);
+        } else {
+            item = peekRegister(parameterRegister);
+        }
+
+        return item;
+    }
+
+    public HeapItem peekRegister(int register) {
+        if (register == MethodState.ResultRegister) {
+            if (!hasRegister(register, METHOD_HEAP)) {
+                if (getParent() != null && !getParent().hasRegister(register, METHOD_HEAP)) {
+                    // ResultRegister can only be read by the instruction immediately after it's set.
+                    // It's not in this instruction or its parent, so it effectively doesn't exist.
+                    log.warn("Attempting to read result register but it's not in current or parent context! Returning null.");
+                    return null;
+                }
+
+            }
+        }
         return super.peekRegister(register, METHOD_HEAP);
     }
 
-    public Object readResultRegister() {
-        Object result = readRegister(ResultRegister, METHOD_HEAP);
-        // TODO: removeRegister and see what breaks..
-        ectx.getHeap().remove(METHOD_HEAP, ResultRegister);
-
-        return result;
+    public void pokeRegister(int register, HeapItem item) {
+        super.pokeRegister(register, item, METHOD_HEAP);
     }
 
-    public Object readReturnRegister() {
+    public void pokeRegister(int register, Object value, String type) {
+        pokeRegister(register, new HeapItem(value, type));
+    }
+
+    public HeapItem readRegister(int register) {
+        return readRegister(register, METHOD_HEAP);
+    }
+
+    public HeapItem readResultRegister() {
+        HeapItem item = readRegister(ResultRegister, METHOD_HEAP);
+
+        return item;
+    }
+
+    public HeapItem readReturnRegister() {
         return peekRegister(ReturnRegister);
     }
 
-    public void setPseudoInstructionReturnAddress(int address) {
+    public void setPseudoInstructionReturnLocation(MethodLocation location) {
         // Pseudo instructions like array-data-payload need return addresses.
-        pokeRegister(ReturnAddress, address, METHOD_HEAP);
+        pokeRegister(ReturnAddress, location, METHOD_HEAP);
     }
 
     @Override
@@ -136,24 +178,24 @@ public class MethodState extends BaseState {
             sb.append("parameters: ").append(parameterCount).append("\n[");
             boolean printingAtLeastOneParameter = false;
             for (int parameterRegister = getParameterStart(); parameterRegister < getRegisterCount();) {
-                sb.append("p").append(parameterRegister).append(": ");
+                sb.append('p').append(parameterRegister).append(": ");
                 if (super.hasRegister(parameterRegister, METHOD_HEAP)) {
                     printingAtLeastOneParameter = true;
-                    sb.append(registerToString(parameterRegister, METHOD_HEAP));
-                    String type = TypeUtil.getValueType(peekRegisterType(parameterRegister, METHOD_HEAP));
-                    if ("J".equals(type) || "D".equals(type)) {
+                    HeapItem item = peekRegister(parameterRegister);
+                    sb.append(item);
+                    if (Utils.getRegisterSize(item.getType()) == 2) {
                         parameterRegister += 1;
                     }
                     sb.append(",\n");
                 } else {
-                    sb.append("*in ancestor*");
+                    sb.append("*in ancestor*\n");
                 }
                 parameterRegister++;
             }
             if (printingAtLeastOneParameter) {
                 sb.setLength(sb.length() - 2);
             }
-            sb.append("]");
+            sb.append(']');
         }
 
         int localsCount = getRegisterCount() - getParameterCount();
@@ -165,13 +207,13 @@ public class MethodState extends BaseState {
                     continue;
                 }
                 hadAtLeastOneLocal = true;
-                sb.append("v").append(register).append(": ").append(registerToString(register, METHOD_HEAP))
-                .append(",\n");
+                sb.append('v').append(register).append(": ").append(registerToString(register, METHOD_HEAP))
+                                .append(",\n");
             }
             if (hadAtLeastOneLocal) {
                 sb.setLength(sb.length() - 2);
             }
-            sb.append("]");
+            sb.append(']');
         }
 
         if (hasRegister(ResultRegister, METHOD_HEAP)) {
@@ -187,10 +229,6 @@ public class MethodState extends BaseState {
 
     public boolean wasRegisterRead(int register) {
         return wasRegisterRead(register, METHOD_HEAP);
-    }
-
-    public void assignRegisterAndUpdateIdentities(int register, Object value) {
-        assignRegisterAndUpdateIdentities(register, value, METHOD_HEAP);
     }
 
     MethodState getChild(ExecutionContext childContext) {

@@ -1,11 +1,15 @@
 package org.cf.smalivm.context;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
+import org.cf.smalivm.VirtualException;
 import org.cf.smalivm.opcode.ExecutionContextOp;
 import org.cf.smalivm.opcode.MethodStateOp;
 import org.cf.smalivm.opcode.Op;
+import org.jf.dexlib2.builder.MethodLocation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,21 +20,32 @@ public class ExecutionNode {
     private static Logger log = LoggerFactory.getLogger(ExecutionNode.class.getSimpleName());
 
     private final List<ExecutionNode> children;
-    private ExecutionContext ectx;
     private final Op op;
-    private ExecutionNode parent;
 
-    public ExecutionNode(Op op) {
-        this.op = op;
-        children = new ArrayList<ExecutionNode>(op.getPossibleChildren().length);
-    }
+    private ExecutionContext ectx;
+    private ExecutionNode parent;
+    private Set<VirtualException> exceptions;
+    private MethodLocation[] childLocations;
 
     public ExecutionNode(ExecutionNode other) {
         op = other.op;
         children = new ArrayList<ExecutionNode>(other.getChildren());
     }
 
-    public int[] execute() {
+    public ExecutionNode(Op op) {
+        this.op = op;
+        children = new ArrayList<ExecutionNode>(op.getChildren().length);
+    }
+
+    public void clearChildren() {
+        setChildLocations();
+    }
+
+    public void clearExceptions() {
+        exceptions = new HashSet<VirtualException>();
+    }
+
+    public void execute() {
         ExecutionContext ectx = getContext();
         if (log.isDebugEnabled()) {
             StringBuilder sb = new StringBuilder();
@@ -39,19 +54,30 @@ public class ExecutionNode {
             log.debug(sb.toString());
         }
 
-        int[] result = null;
         if (op instanceof MethodStateOp) {
             MethodState mState = ectx.getMethodState();
-            result = ((MethodStateOp) op).execute(mState);
+            ((MethodStateOp) op).execute(this, mState);
         } else if (op instanceof ExecutionContextOp) {
-            result = ((ExecutionContextOp) op).execute(ectx);
+            ((ExecutionContextOp) op).execute(this, ectx);
         }
 
         if (log.isDebugEnabled()) {
             log.debug("Context after:\n" + ectx);
         }
 
-        return result;
+        // Op didn't set children specifically. Pull in template values.
+        if (childLocations == null) {
+            setChildLocations(op.getChildren());
+        }
+
+        // Op didn't set exceptions specifically. Pull in template values.
+        if (exceptions == null) {
+            setExceptions(op.getExceptions());
+        }
+    }
+
+    public void setChildLocations(MethodLocation... childLocations) {
+        this.childLocations = childLocations;
     }
 
     public int getAddress() {
@@ -62,12 +88,8 @@ public class ExecutionNode {
         return ectx.getCallDepth();
     }
 
-    public ExecutionNode getChild(Op childOp) {
-        ExecutionNode child = new ExecutionNode(childOp);
-        child.setContext(ectx.getChild());
-        child.setParent(this);
-
-        return child;
+    public MethodLocation[] getChildLocations() {
+        return childLocations;
     }
 
     public List<ExecutionNode> getChildren() {
@@ -78,6 +100,10 @@ public class ExecutionNode {
         return ectx;
     }
 
+    public Set<VirtualException> getExceptions() {
+        return exceptions;
+    }
+
     public Op getOp() {
         return op;
     }
@@ -86,33 +112,52 @@ public class ExecutionNode {
         return parent;
     }
 
+    public boolean mayThrowException() {
+        return exceptions != null && exceptions.size() > 0;
+    }
+
     public void removeChild(ExecutionNode child) {
+        // http://stream1.gifsoup.com/view/773318/not-the-father-dance-o.gif
         children.remove(child);
     }
 
     public void replaceChild(ExecutionNode oldChild, ExecutionNode newChild) {
-        int index = children.indexOf(oldChild);
-        // http://stream1.gifsoup.com/view/773318/not-the-father-dance-o.gif
-        assert index >= 0;
-        children.remove(index);
-        newChild.setParent(this);
+        removeChild(oldChild);
+        newChild.setParentNode(this);
     }
 
     public void setContext(ExecutionContext ectx) {
         this.ectx = ectx;
     }
 
+    public void setException(VirtualException exception) {
+        exceptions = new HashSet<VirtualException>();
+        exceptions.add(exception);
+    }
+
+    public void setExceptions(Set<VirtualException> exceptions) {
+        this.exceptions = exceptions;
+    }
+
     public void setMethodState(MethodState mState) {
         ectx.setMethodState(mState);
     }
 
-    public void setParent(ExecutionNode parent) {
+    public void setParentNode(ExecutionNode parent) {
         // All nodes will have [0,1] parents since a node represents both an instruction and a context, or vm state.
         // Each execution of an instruction will have a new state.
         this.parent = parent;
         if (parent != null) {
-            parent.addChild(this);
+            parent.addChildNode(this);
         }
+    }
+
+    public ExecutionNode spawnChild(Op childOp) {
+        ExecutionNode child = new ExecutionNode(childOp);
+        child.setContext(ectx.spawnChild());
+        child.setParentNode(this);
+
+        return child;
     }
 
     public String toGraph() {
@@ -129,7 +174,7 @@ public class ExecutionNode {
         return op.toString();
     }
 
-    private void addChild(ExecutionNode child) {
+    private void addChildNode(ExecutionNode child) {
         children.add(child);
     }
 
@@ -144,7 +189,7 @@ public class ExecutionNode {
         for (ExecutionNode child : getChildren()) {
             String op = toString().replaceAll(DOT, "?").replace("\"", "\\\"");
             String ctx = parentMethodState.toString().replaceAll(DOT, "?").replace("\"", "\\\"").trim();
-            sb.append("\"").append(getAddress()).append("\n").append(op).append("\n").append(ctx).append("\"");
+            sb.append('"').append(getAddress()).append('\n').append(op).append('\n').append(ctx).append('"');
 
             sb.append(" -> ");
 
@@ -152,8 +197,8 @@ public class ExecutionNode {
             MethodState childMethodState = childExecutionContext.getMethodState();
             op = toString().replaceAll(DOT, "?").replace("\"", "\\\"");
             ctx = childMethodState.toString().replaceAll(DOT, "?").replace("\"", "\\\"").trim();
-            sb.append("\"").append(getAddress()).append("\n").append(op).append("\n").append(ctx).append("\"");
-            sb.append("\n");
+            sb.append('"').append(getAddress()).append('\n').append(op).append('\n').append(ctx).append('"');
+            sb.append('\n');
 
             child.getGraph(sb, visitedNodes);
         }

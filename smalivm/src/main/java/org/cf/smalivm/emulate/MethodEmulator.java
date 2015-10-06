@@ -2,9 +2,12 @@ package org.cf.smalivm.emulate;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 import org.cf.smalivm.SideEffect;
-import org.cf.smalivm.context.MethodState;
+import org.cf.smalivm.VirtualException;
+import org.cf.smalivm.VirtualMachine;
+import org.cf.smalivm.context.ExecutionContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -12,39 +15,86 @@ public class MethodEmulator {
 
     private static final Logger log = LoggerFactory.getLogger(MethodEmulator.class.getSimpleName());
 
-    private static Map<String, EmulatedMethod> emulatedMethods = new HashMap<String, EmulatedMethod>();
-    static {
-        addMethod("Lorg/cf/simplify/Utils;->breakpoint()V", new org_cf_simplify_Utils_breakpoint());
-        addMethod("Ljava/lang/Class;->getPackage()Ljava/lang/Package;", new java_lang_Class_getPackage());
-        addMethod("Ljava/lang/Package;->getName()Ljava/lang/String;", new java_lang_Package_getName());
-        addMethod("Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;", new java_lang_Class_forName());
-        addMethod("Ljava/lang/Class;->getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
-                        new java_lang_Class_getMethod());
+    private final VirtualMachine vm;
+    private final ExecutionContext ectx;
+    private final String methodDescriptor;
+    private final EmulatedMethod method;
+
+    public MethodEmulator(VirtualMachine vm, ExecutionContext ectx, String methodDescriptor) {
+        this.vm = vm;
+        this.ectx = ectx;
+        this.methodDescriptor = methodDescriptor;
+        method = getMethod(methodDescriptor);
     }
 
-    public static void addMethod(String methodDescriptor, EmulatedMethod method) {
-        emulatedMethods.put(methodDescriptor, method);
+    private static EmulatedMethod getMethod(String methodDescriptor) {
+        Class<? extends EmulatedMethod> methodClass = emulatedMethods.get(methodDescriptor);
+        EmulatedMethod em = null;
+        try {
+            em = methodClass.newInstance();
+        } catch (InstantiationException | IllegalAccessException e) {
+            e.printStackTrace();
+        }
+
+        return em;
+    }
+
+    private static Map<String, Class<? extends EmulatedMethod>> emulatedMethods = new HashMap<String, Class<? extends EmulatedMethod>>();
+    static {
+        addMethod("Lorg/cf/simplify/Utils;->breakpoint()V", org_cf_simplify_Utils_breakpoint.class);
+        addMethod("Ljava/lang/Class;->getPackage()Ljava/lang/Package;", java_lang_Class_getPackage.class);
+        addMethod("Ljava/lang/Package;->getName()Ljava/lang/String;", java_lang_Package_getName.class);
+        addMethod("Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;", java_lang_Class_forName.class);
+        addMethod("Ljava/lang/Class;->getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+                        java_lang_Class_getMethod.class);
+        addMethod("Ljava/lang/Class;->getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+                        java_lang_Class_getMethod.class);
+        addMethod("Ljava/lang/Class;->getField(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+                        java_lang_Class_getField.class);
+        addMethod("Ljava/lang/Class;->getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;",
+                        java_lang_Class_getField.class);
+        addMethod("Ljava/lang/reflect/Field;->get(Ljava/lang/Object;)Ljava/lang/Object;",
+                        java_lang_reflect_Field_get.class);
+    }
+
+    public static void addMethod(String methodDescriptor, Class<? extends EmulatedMethod> methodClass) {
+        emulatedMethods.put(methodDescriptor, methodClass);
     }
 
     public static boolean canEmulate(String methodDescriptor) {
         return emulatedMethods.containsKey(methodDescriptor);
     }
 
+    public static boolean canHandleUnknownValues(String methodDescriptor) {
+        Class<? extends EmulatedMethod> methodClass = emulatedMethods.get(methodDescriptor);
+
+        return (methodClass != null) && (methodClass.isAssignableFrom(UnknownValuesMethod.class));
+    }
+
     public static void clearMethods() {
         emulatedMethods.clear();
     }
 
-    public static SideEffect.Level emulate(MethodState mState, String methodDescriptor, int[] parameterRegisters) {
-        EmulatedMethod em = emulatedMethods.get(methodDescriptor);
+    public void emulate() {
         try {
-            em.execute(mState);
+            if (method instanceof MethodStateMethod) {
+                ((MethodStateMethod) method).execute(vm, ectx.getMethodState());
+            } else {
+                ((ExecutionContextMethod) method).execute(vm, ectx);
+            }
         } catch (Exception e) {
-            // TODO: try/catch handling :D
             if (log.isWarnEnabled()) {
-                log.warn("Exception while emulating method " + methodDescriptor, e);
+                log.warn("Unexpected real exception emulating " + methodDescriptor, e);
             }
         }
-
-        return em.getSideEffectLevel();
     }
+
+    public SideEffect.Level getSideEffectLevel() {
+        return method.getSideEffectLevel();
+    }
+
+    public Set<VirtualException> getExceptions() {
+        return method.getExceptions();
+    }
+
 }

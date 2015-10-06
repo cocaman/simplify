@@ -1,17 +1,19 @@
 package org.cf.smalivm.opcode;
 
 import org.cf.smalivm.context.ExecutionContext;
+import org.cf.smalivm.context.ExecutionNode;
+import org.jf.dexlib2.builder.MethodLocation;
 
 public abstract class ExecutionContextOp extends Op {
 
-    ExecutionContextOp(int address, String opName, int childAddress) {
-        super(address, opName, childAddress);
+    ExecutionContextOp(MethodLocation location, MethodLocation child) {
+        super(location, child);
     }
 
-    ExecutionContextOp(int address, String opName, int[] childAddresses) {
-        super(address, opName, childAddresses);
+    ExecutionContextOp(MethodLocation location, MethodLocation[] children) {
+        super(location, children);
     }
 
-    public abstract int[] execute(ExecutionContext ectx);
+    public abstract void execute(ExecutionNode executionNode, ExecutionContext ectx);
 
 }

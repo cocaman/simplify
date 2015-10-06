@@ -1,74 +1,60 @@
 package org.cf.smalivm.opcode;
 
-import org.cf.smalivm.VirtualMachine;
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
 import org.cf.smalivm.context.MethodState;
-import org.cf.smalivm.type.UnknownValue;
 import org.cf.util.Utils;
-import org.jf.dexlib2.iface.instruction.Instruction;
-import org.jf.dexlib2.iface.instruction.formats.Instruction22c;
-import org.jf.dexlib2.util.ReferenceUtil;
+import org.jf.dexlib2.builder.MethodLocation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class NewArrayOp extends MethodStateOp {
 
-    static NewArrayOp create(Instruction instruction, int address, VirtualMachine vm) {
-        String opName = instruction.getOpcode().name;
-        int childAddress = address + instruction.getCodeUnits();
-
-        Instruction22c instr = (Instruction22c) instruction;
-        int destRegister = instr.getRegisterA();
-        int dimensionRegister = instr.getRegisterB();
-
-        // [[Lsome_class;
-        String typeReference = ReferenceUtil.getReferenceString(instr.getReference());
-
-        String baseClassName = typeReference.replace("[", "");
-        boolean isLocalClass = vm.isLocalClass(baseClassName);
-
-        return new NewArrayOp(address, opName, childAddress, destRegister, dimensionRegister, typeReference,
-                        isLocalClass);
-    }
+    private static final Logger log = LoggerFactory.getLogger(NewArrayOp.class.getSimpleName());
 
     private final int destRegister;
-    private final int dimensionRegister;
-    private final boolean isLocalClass;
-    private final String typeReference;
+    private final int lengthRegister;
+    private final boolean useLocalClass;
+    private final String arrayType;
 
-    private NewArrayOp(int address, String opName, int childAddress, int destRegister, int dimensionRegister,
-                    String typeReference, boolean isLocalClass) {
-        super(address, opName, childAddress);
+    NewArrayOp(MethodLocation location, MethodLocation child, int destRegister, int lengthRegister, String arrayType,
+                    boolean useLocalClass) {
+        super(location, child);
 
         this.destRegister = destRegister;
-        this.dimensionRegister = dimensionRegister;
-        this.typeReference = typeReference;
-        this.isLocalClass = isLocalClass;
+        this.lengthRegister = lengthRegister;
+        this.arrayType = arrayType;
+        this.useLocalClass = useLocalClass;
     }
 
     @Override
-    public int[] execute(MethodState mState) {
-        Object dimensionValue = mState.readRegister(dimensionRegister);
-
-        Object instance = null;
-        if (dimensionValue instanceof UnknownValue) {
-            instance = new UnknownValue(typeReference);
+    public void execute(ExecutionNode node, MethodState mState) {
+        HeapItem lengthItem = mState.readRegister(lengthRegister);
+        HeapItem instanceItem;
+        if (lengthItem.isUnknown()) {
+            instanceItem = HeapItem.newUnknown(arrayType);
         } else {
-            int dimension = (int) dimensionValue;
+            int length = lengthItem.getIntegerValue();
             try {
-                instance = Utils.getArrayInstanceFromSmaliTypeReference(typeReference, dimension, isLocalClass);
+                // Dalvik does not statically initialize classes with new-array
+                Object instance = Utils.buildArray(arrayType, length, useLocalClass);
+                instanceItem = new HeapItem(instance, arrayType);
             } catch (ClassNotFoundException e) {
-                // TODO Auto-generated catch block
-                e.printStackTrace();
+                if (log.isWarnEnabled()) {
+                    log.warn("Couldn't find class: {}, using unknown @{}", arrayType, toString());
+                }
+                instanceItem = HeapItem.newUnknown(arrayType);
             }
         }
-        mState.assignRegister(destRegister, instance);
-
-        return getPossibleChildren();
+        mState.assignRegister(destRegister, instanceItem);
     }
 
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder(getName());
-        sb.append(" r").append(destRegister).append(", r").append(dimensionRegister).append(", ").append(typeReference);
+        sb.append(" r").append(destRegister).append(", r").append(lengthRegister).append(", ").append(arrayType);
 
         return sb.toString();
     }
+
 }

@@ -1,69 +1,58 @@
 package org.cf.smalivm.opcode;
 
+import org.cf.smalivm.context.ExecutionNode;
+import org.cf.smalivm.context.HeapItem;
 import org.cf.smalivm.context.MethodState;
-import org.cf.smalivm.type.UnknownValue;
-import org.jf.dexlib2.iface.instruction.Instruction;
-import org.jf.dexlib2.iface.instruction.formats.Instruction12x;
+import org.cf.util.Utils;
+import org.jf.dexlib2.builder.MethodLocation;
 
 public class UnaryMathOp extends MethodStateOp {
 
-    private static String getDestinationTypeName(String opName) {
+    private static String getResultTypeName(String opName) {
         String[] parts = opName.split("-");
         String type = parts[parts.length - 1];
-        switch (type) {
-        case "int":
-            return "I";
-        case "long":
-            return "J";
-        case "float":
-            return "F";
-        case "byte":
-            return "B";
-        case "char":
-            return "C";
-        case "double":
-            return "D";
-        case "short":
-            return "S";
+        String resultType = null;
+        if ("int".equals(type)) {
+            resultType = "I";
+        } else if ("long".equals(type)) {
+            resultType = "J";
+        } else if ("float".equals(type)) {
+            resultType = "F";
+        } else if ("byte".equals(type)) {
+            resultType = "B";
+        } else if ("char".equals(type)) {
+            resultType = "C";
+        } else if ("double".equals(type)) {
+            resultType = "D";
+        } else if ("short".equals(type)) {
+            resultType = "S";
         }
 
-        return null;
+        return resultType;
     }
 
-    static UnaryMathOp create(Instruction instruction, int address) {
-        String opName = instruction.getOpcode().name;
-        int childAddress = address + instruction.getCodeUnits();
-
-        Instruction12x instr = (Instruction12x) instruction;
-        int destRegister = instr.getRegisterA();
-        int srcRegister = instr.getRegisterB();
-        return new UnaryMathOp(address, opName, childAddress, destRegister, srcRegister);
-    }
     private final int destRegister;
-
     private final int srcRegister;
 
-    private UnaryMathOp(int address, String opName, int childAddress, int destRegister, int srcRegister) {
-        super(address, opName, childAddress);
+    UnaryMathOp(MethodLocation location, MethodLocation child, int destRegister, int srcRegister) {
+        super(location, child);
 
         this.destRegister = destRegister;
         this.srcRegister = srcRegister;
     }
 
     @Override
-    public int[] execute(MethodState mState) {
-        Object value = mState.readRegister(srcRegister);
-        Object newValue = null;
-        if (value instanceof UnknownValue) {
-            String destType = getDestinationTypeName(getName());
-            newValue = new UnknownValue(destType);
+    public void execute(ExecutionNode node, MethodState mState) {
+        HeapItem item = mState.readRegister(srcRegister);
+        HeapItem resultItem;
+        String type = getResultTypeName(getName());
+        if (item.isUnknown()) {
+            resultItem = HeapItem.newUnknown(type);
         } else {
-            newValue = perform(value, getName());
+            Object resultValue = perform(item.getValue(), getName());
+            resultItem = new HeapItem(resultValue, type);
         }
-
-        mState.assignRegister(destRegister, newValue);
-
-        return this.getPossibleChildren();
+        mState.assignRegister(destRegister, resultItem);
     }
 
     @Override
@@ -76,74 +65,75 @@ public class UnaryMathOp extends MethodStateOp {
 
     private Object perform(Object value, String opName) {
         // Stupid, but simple. Deals.
-        Object result = null;
+        Object resultValue = null;
         if (opName.startsWith("double")) {
-            Double typedValue = (Double) value;
+            Double typedValue = Utils.getDoubleValue(value);
             if (opName.endsWith("float")) {
-                result = typedValue.floatValue();
+                resultValue = typedValue.floatValue();
             } else if (opName.endsWith("int")) {
-                result = typedValue.intValue();
+                resultValue = typedValue.intValue();
             } else if (opName.endsWith("long")) {
-                result = typedValue.longValue();
+                resultValue = typedValue.longValue();
             }
         } else if (opName.startsWith("float")) {
-            Float typedValue = (Float) value;
+            Float typedValue = Utils.getFloatValue(value);
             if (opName.endsWith("double")) {
-                result = typedValue.doubleValue();
+                resultValue = typedValue.doubleValue();
             } else if (opName.endsWith("int")) {
-                result = typedValue.intValue();
+                resultValue = typedValue.intValue();
             } else if (opName.endsWith("long")) {
-                result = typedValue.longValue();
+                resultValue = typedValue.longValue();
             }
         } else if (opName.startsWith("long")) {
-            Long typedValue = (Long) value;
+            Long typedValue = Utils.getLongValue(value);
             if (opName.endsWith("double")) {
-                result = typedValue.doubleValue();
+                resultValue = typedValue.doubleValue();
             } else if (opName.endsWith("int")) {
-                result = typedValue.intValue();
+                resultValue = typedValue.intValue();
             } else if (opName.endsWith("float")) {
-                result = typedValue.floatValue();
+                resultValue = typedValue.floatValue();
             }
         } else if (opName.startsWith("int")) {
-            Integer typedValue = (Integer) value;
+            // Could be something other than an int, such as short
+            Integer typedValue = Utils.getIntegerValue(value);
             if (opName.endsWith("byte")) {
-                result = typedValue.byteValue();
+                resultValue = typedValue.byteValue();
             } else if (opName.endsWith("char")) {
-                result = (char) typedValue.intValue();
+                resultValue = (char) typedValue.intValue();
             } else if (opName.endsWith("short")) {
-                result = typedValue.shortValue();
+                resultValue = typedValue.shortValue();
             } else if (opName.endsWith("double")) {
-                result = typedValue.doubleValue();
+                resultValue = typedValue.doubleValue();
             } else if (opName.endsWith("long")) {
-                result = typedValue.longValue();
+                resultValue = typedValue.longValue();
             } else if (opName.endsWith("float")) {
-                result = typedValue.floatValue();
+                resultValue = typedValue.floatValue();
             }
         } else if (opName.startsWith("neg")) {
             if (opName.endsWith("double")) {
-                Double typedValue = (Double) value;
-                result = -typedValue;
+                Double typedValue = Utils.getDoubleValue(value);
+                resultValue = -typedValue;
             } else if (opName.endsWith("float")) {
-                Float typedValue = (Float) value;
-                result = -typedValue;
+                Float typedValue = Utils.getFloatValue(value);
+                resultValue = -typedValue;
             } else if (opName.endsWith("int")) {
-                Integer typedValue = (Integer) value;
-                result = -typedValue;
+                Integer typedValue = Utils.getIntegerValue(value);
+                resultValue = -typedValue;
             } else if (opName.endsWith("long")) {
-                Long typedValue = (Long) value;
-                result = -typedValue;
+                Long typedValue = Utils.getLongValue(value);
+                resultValue = -typedValue;
             }
         } else if (opName.startsWith("not")) {
             if (opName.endsWith("int")) {
-                Integer typedValue = (Integer) value;
-                result = ~typedValue;
+                Integer typedValue = Utils.getIntegerValue(value);
+                resultValue = ~typedValue;
             } else if (opName.endsWith("long")) {
-                Long typedValue = (Long) value;
-                result = ~typedValue;
+                Long typedValue = Utils.getLongValue(value);
+                resultValue = ~typedValue;
             }
         }
 
-        return result;
+        return resultValue;
     }
 
 }

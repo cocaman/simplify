@@ -6,10 +6,12 @@ import gnu.trove.list.array.TIntArrayList;
 import java.util.HashMap;
 import java.util.Map;
 
+import org.cf.simplify.ConstantBuilder;
 import org.cf.simplify.MethodBackedGraph;
+import org.cf.smalivm.context.HeapItem;
+import org.cf.smalivm.context.MethodState;
 import org.cf.smalivm.opcode.InvokeOp;
 import org.cf.smalivm.opcode.Op;
-import org.cf.smalivm.type.UnknownValue;
 import org.cf.util.SmaliClassUtils;
 import org.jf.dexlib2.Opcode;
 import org.jf.dexlib2.builder.BuilderInstruction;
@@ -27,11 +29,11 @@ public class PeepholeStrategy implements OptimizationStrategy {
     private static final Logger log = LoggerFactory.getLogger(PeepholeStrategy.class.getSimpleName());
 
     private static final String ClassForNameSignature = "Ljava/lang/Class;->forName(Ljava/lang/String;)Ljava/lang/Class;";
-    private static final String MethodInvokeSignature = "Ljava/lang/reflect/Method;->invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;";
 
     private final MethodBackedGraph mbgraph;
     private int peepCount;
     private TIntList addresses;
+    private boolean madeChanges;
 
     public PeepholeStrategy(MethodBackedGraph mbgraph) {
         this.mbgraph = mbgraph;
@@ -46,6 +48,68 @@ public class PeepholeStrategy implements OptimizationStrategy {
         return result;
     }
 
+    public boolean perform() {
+        madeChanges = false;
+
+        addresses = getValidAddresses(mbgraph);
+        peepClassForName();
+
+        addresses = getValidAddresses(mbgraph);
+        peepStringInit();
+
+        return madeChanges;
+    }
+
+    BuilderInstruction buildClassForNameReplacement(int address) {
+        InvokeOp op = (InvokeOp) mbgraph.getOp(address);
+        int[] parameterRegisters = op.getParameterRegisters();
+        int register = parameterRegisters[0];
+        String javaClassName = (String) mbgraph.getRegisterConsensusValue(address, register);
+        String smaliClassName = SmaliClassUtils.javaClassToSmali(javaClassName);
+        HeapItem klazz = mbgraph.getRegisterConsensus(address, MethodState.ResultRegister);
+        if (klazz == null) {
+            log.warn("Optimizing Class.forName of potentially non-existant class: " + smaliClassName);
+        }
+        BuilderTypeReference classRef = mbgraph.getDexBuilder().internTypeReference(smaliClassName);
+        BuilderInstruction constClassInstruction = new BuilderInstruction21c(Opcode.CONST_CLASS, register, classRef);
+
+        return constClassInstruction;
+    }
+
+    boolean canPeepClassForName(int address) {
+        Op op = mbgraph.getOp(address);
+        if (!(op instanceof InvokeOp)) {
+            return false;
+        }
+
+        BuilderInstruction instruction = mbgraph.getInstruction(address);
+        ReferenceInstruction instr = (ReferenceInstruction) instruction;
+        String methodDescriptor = ReferenceUtil.getReferenceString(instr.getReference());
+        if (!methodDescriptor.equals(ClassForNameSignature)) {
+            return false;
+        }
+
+        int[] parameterRegisters = ((InvokeOp) op).getParameterRegisters();
+        int registerA = parameterRegisters[0];
+        HeapItem className = mbgraph.getRegisterConsensus(address, registerA);
+        if (className.isUnknown()) {
+            return false;
+        }
+
+        return true;
+    }
+
+    TIntList getValidAddresses(MethodBackedGraph mbgraph) {
+        TIntList result = new TIntArrayList(mbgraph.getAddresses());
+        for (int address : result.toArray()) {
+            if (!mbgraph.wasAddressReached(address)) {
+                result.remove(address);
+            }
+        }
+
+        return result;
+    }
+
     void peepClassForName() {
         TIntList peepAddresses = new TIntArrayList();
         for (int address : addresses.toArray()) {
@@ -54,7 +118,13 @@ public class PeepholeStrategy implements OptimizationStrategy {
             }
         }
 
+        if (0 == peepAddresses.size()) {
+            return;
+        }
+
+        madeChanges = true;
         peepCount += peepAddresses.size();
+
         peepAddresses.sort();
         peepAddresses.reverse();
         for (int address : peepAddresses.toArray()) {
@@ -90,113 +160,35 @@ public class PeepholeStrategy implements OptimizationStrategy {
             }
 
             int instanceRegister = instr.getRegisterC();
-            Object value = mbgraph.getRegisterConsensus(address, instanceRegister);
-            if (!(value instanceof String)) {
+            HeapItem item = mbgraph.getRegisterConsensus(address, instanceRegister);
+            if (!(item.getValue() instanceof String)) {
                 // Not UnknownValue
                 continue;
             }
             peepAddresses.add(address);
         }
 
+        if (0 == peepAddresses.size()) {
+            return;
+        }
+
+        madeChanges = true;
         peepCount += peepAddresses.size();
+
         peepAddresses.sort();
         peepAddresses.reverse();
         for (int address : peepAddresses.toArray()) {
             BuilderInstruction original = mbgraph.getInstruction(address);
             Instruction35c instr = (Instruction35c) original;
             int instanceRegister = instr.getRegisterC();
-            Object value = mbgraph.getRegisterConsensus(address, instanceRegister);
-            BuilderInstruction replacement = ConstantPropigationStrategy.buildConstant(value, instanceRegister,
-                            mbgraph.getDexBuilder());
+            HeapItem item = mbgraph.getRegisterConsensus(address, instanceRegister);
+            BuilderInstruction replacement = ConstantBuilder.buildConstant(item.getValue(), item.getUnboxedValueType(),
+                            instanceRegister, mbgraph.getDexBuilder());
             if (log.isDebugEnabled()) {
                 log.debug("Peeping string init @" + address + " " + mbgraph.getOp(address));
             }
             mbgraph.replaceInstruction(address, replacement);
         }
-    }
-
-    public boolean perform() {
-        addresses = getValidAddresses(mbgraph);
-        peepClassForName();
-
-        addresses = getValidAddresses(mbgraph);
-        peepStringInit();
-
-        return peepCount > 0;
-    }
-
-    BuilderInstruction buildClassForNameReplacement(int address) {
-        InvokeOp op = (InvokeOp) mbgraph.getOp(address);
-        int[] parameterRegisters = op.getParameterRegisters();
-        int register = parameterRegisters[0];
-        String javaClassName = (String) mbgraph.getRegisterConsensus(address, register);
-        String smaliClassName = SmaliClassUtils.javaClassToSmali(javaClassName);
-        BuilderTypeReference classRef = mbgraph.getDexBuilder().internTypeReference(smaliClassName);
-        BuilderInstruction constClassInstruction = new BuilderInstruction21c(Opcode.CONST_CLASS, register, classRef);
-
-        return constClassInstruction;
-    }
-
-    boolean canPeepClassForName(int address) {
-        Op handler = mbgraph.getOp(address);
-        if (!(handler instanceof InvokeOp)) {
-            return false;
-        }
-
-        BuilderInstruction instruction = mbgraph.getInstruction(address);
-        ReferenceInstruction instr = (ReferenceInstruction) instruction;
-        String ref = ReferenceUtil.getReferenceString(instr.getReference());
-        if (!ref.equals(ClassForNameSignature)) {
-            return false;
-        }
-
-        int[] parameterRegisters = ((InvokeOp) handler).getParameterRegisters();
-        int registerA = parameterRegisters[0];
-        Object classNameValue = mbgraph.getRegisterConsensus(address, registerA);
-        if (classNameValue instanceof UnknownValue) {
-            return false;
-        }
-
-        return true;
-    }
-
-    boolean canPeepMethodInvoke(int address) {
-        Op handler = mbgraph.getOp(address);
-        if (!(handler instanceof InvokeOp)) {
-            return false;
-        }
-
-        BuilderInstruction instruction = mbgraph.getInstruction(address);
-        ReferenceInstruction instr = (ReferenceInstruction) instruction;
-        String ref = ReferenceUtil.getReferenceString(instr.getReference());
-        if (!ref.equals(MethodInvokeSignature)) {
-            return false;
-        }
-
-        int[] parameterRegisters = ((InvokeOp) handler).getParameterRegisters();
-        int methodRegister = parameterRegisters[0];
-        int targetRegister = parameterRegisters[1];
-        int parametersRegister = parameterRegisters[2];
-
-        Object value1 = mbgraph.getRegisterConsensus(address, methodRegister);
-        Object value2 = mbgraph.getRegisterConsensus(address, targetRegister);
-        Object value3 = mbgraph.getRegisterConsensus(address, parametersRegister);
-
-        // check instanceof UnknownValue
-        System.out.println(value1 + " " + value2 + " " + value3);
-
-        return false;
-    }
-
-    TIntList getValidAddresses(MethodBackedGraph mbgraph) {
-        TIntList result = new TIntArrayList(mbgraph.getAddresses());
-        for (int address : result.toArray()) {
-            if (!mbgraph.wasAddressReached(address)) {
-                result.remove(address);
-            }
-        }
-
-        return result;
     }
 
 }

@@ -1,6 +1,8 @@
 package org.cf.util;
 
 import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 
 import com.google.common.collect.BiMap;
@@ -46,12 +48,35 @@ public class SmaliClassUtils {
         javaPrimitiveToType.put("short", Short.TYPE);
     }
 
+    public static String smaliWrapperToSmaliPrimitive(String type) {
+        String javaType = smaliClassToJava(type);
+
+        return smaliPrimitiveToJavaWrapper.inverse().get(javaType);
+    }
+
     public static boolean isPrimitiveType(String type) {
         return smaliPrimitiveToJavaName.containsKey(getBaseClass(type));
     }
 
+    public static boolean isWrapperType(String type) {
+        return smaliWrapperToSmaliPrimitive(type) != null;
+    }
+
+    public static boolean isPrimitiveOrWrapperType(String type) {
+        return isPrimitiveType(type) || isWrapperType(type);
+    }
+
     public static String javaClassToSmali(Class<?> klazz) {
         return javaClassToSmali(klazz.getName());
+    }
+
+    public static List<String> javaClassToSmali(Class<?>... classes) {
+        List<String> smaliNames = new LinkedList<String>();
+        for (Class<?> klazz : classes) {
+            smaliNames.add(javaClassToSmali(klazz));
+        }
+
+        return smaliNames;
     }
 
     public static String javaClassToSmali(String className) {
@@ -69,7 +94,10 @@ public class SmaliClassUtils {
             return className;
         }
 
-        return "L" + className.replaceAll("\\.", "/") + ";";
+        StringBuilder sb = new StringBuilder("L");
+        sb.append(className.replaceAll("\\.", "/")).append(';');
+
+        return sb.toString();
     }
 
     public static String smaliClassToJava(String className) {
@@ -79,7 +107,7 @@ public class SmaliClassUtils {
 
         String javaName = smaliPrimitiveToJavaName.get(className);
         if (null != javaName) {
-            // e.g. I becomes int
+            // e.g. "I" -> "int"
             return javaName;
         }
 
@@ -103,24 +131,31 @@ public class SmaliClassUtils {
             return javaWrapper;
         }
 
-        int lastIndex = className.lastIndexOf("[");
+        int lastIndex = className.lastIndexOf('[');
         String dimens = className.substring(0, lastIndex + 1);
         StringBuilder sb = new StringBuilder(dimens);
-        sb.append("L").append(javaWrapper).append(";");
+        sb.append('L').append(javaWrapper).append(';');
 
         return sb.toString();
     }
 
     public static String getPackageName(String smaliType) {
-        String packageName = smaliType.substring(1, smaliType.lastIndexOf("/"));
+        String packageName = smaliType.substring(1, smaliType.lastIndexOf('/'));
         packageName = packageName.replaceAll("/", ".");
 
         return packageName;
     }
 
+    // Remove any array qualifiers, e.g. [[B becomes B
     public static String getBaseClass(String className) {
-        // Remove any array qualifiers, e.g. [[B (2d byte array) becomes B
         return className.replace("[", "");
+    }
+
+    // Similar to Array.getComponentType
+    public static String getComponentType(String arrayType) {
+        assert arrayType.startsWith("[");
+
+        return arrayType.replaceFirst("\\[", "");
     }
 
     public static Class<?> getPrimitiveType(String javaClassName) {

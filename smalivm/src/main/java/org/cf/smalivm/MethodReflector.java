@@ -9,9 +9,11 @@ import java.util.Set;
 
 import org.apache.commons.beanutils.ConstructorUtils;
 import org.apache.commons.beanutils.MethodUtils;
+import org.cf.smalivm.context.HeapItem;
 import org.cf.smalivm.context.MethodState;
 import org.cf.smalivm.type.UnknownValue;
 import org.cf.util.ConfigLoader;
+import org.cf.util.Utils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,7 +77,8 @@ public class MethodReflector {
         UnsafeMethods = new HashSet<String>(lines);
     }
 
-    private final String className;
+    private final String smaliClassName;
+    private final String javaIshClassName;
     private final boolean isStatic;
     private final String methodDescriptor;
     private final String methodName;
@@ -90,50 +93,49 @@ public class MethodReflector {
 
         String[] parts = methodDescriptor.split("->");
         // ClassUtils expects "Ljava.lang.Class;"
-        className = parts[0].replaceAll("/", ".");
+        smaliClassName = parts[0];
+        javaIshClassName = smaliClassName.replaceAll("/", ".");
         methodName = parts[1].substring(0, parts[1].indexOf("("));
     }
 
     public void reflect(MethodState calleeContext) {
         if (log.isDebugEnabled()) {
-            log.debug("Reflecting " + methodDescriptor + " with context:\n" + calleeContext);
+            log.debug("Reflecting {} with context:\n{}", methodDescriptor, calleeContext);
         }
 
-        Object result = null;
+        Object resultValue = null;
         try {
-            // Class<?> clazz = ClassUtils.getClass(className, false);
-            // String leading 'L' and trailing ';' from smali type descriptor
-            Class<?> clazz = Class.forName(className.substring(1, className.length() - 1));
+            // Class<?> clazz = ClassUtils.getClass(javaIshClassName, false);
+            // Strip leading 'L' and trailing ';' from smali type descriptor
+            Class<?> clazz = Class.forName(javaIshClassName.substring(1, javaIshClassName.length() - 1));
             Object[] args = getArguments(calleeContext);
             if ("<init>".equals(methodName)) {
                 // This class is used by the JVM to do instance initialization, i.e. newInstance. Can't just reflect it.
                 if (log.isDebugEnabled()) {
-                    log.debug("Reflecting " + methodDescriptor + ", clazz=" + clazz + " args=" + Arrays.toString(args));
+                    log.debug("Reflecting {}, clazz={} args={}", methodDescriptor, clazz, Arrays.toString(args));
                 }
-                result = ConstructorUtils.invokeConstructor(clazz, args);
-                calleeContext.assignParameter(0, result); // kind of a hack, just store newly init'ed value here
+                resultValue = ConstructorUtils.invokeConstructor(clazz, args);
+                // kind of a hack. store newly init'ed value here
+                calleeContext.assignParameter(0, new HeapItem(resultValue, smaliClassName));
             } else {
                 if (isStatic) {
                     if (log.isDebugEnabled()) {
-                        log.debug("Reflecting " + methodDescriptor + ", clazz=" + clazz + " args="
-                                        + Arrays.toString(args));
+                        log.debug("Reflecting {}, clazz={} args={}", methodDescriptor, clazz, Arrays.toString(args));
                     }
-                    result = MethodUtils.invokeStaticMethod(clazz, methodName, args);
+                    resultValue = MethodUtils.invokeStaticMethod(clazz, methodName, args);
                 } else {
-                    Object target = calleeContext.peekRegister(0);
+                    HeapItem targetItem = calleeContext.peekRegister(0);
                     if (log.isDebugEnabled()) {
-                        log.debug("Reflecting " + methodDescriptor + ", target=" + target + " args="
-                                        + Arrays.toString(args));
+                        log.debug("Reflecting {}, target={} args={}", methodDescriptor, targetItem,
+                                        Arrays.toString(args));
                     }
-                    result = MethodUtils.invokeMethod(target, methodName, args);
+                    resultValue = MethodUtils.invokeMethod(targetItem.getValue(), methodName, args);
                 }
             }
-        } catch (NullPointerException | ClassNotFoundException | NoSuchMethodException | SecurityException
-                        | InstantiationException | IllegalAccessException | IllegalArgumentException
-                        | InvocationTargetException e) {
-            result = new UnknownValue(returnType);
+        } catch (NullPointerException | ClassNotFoundException | NoSuchMethodException | SecurityException | InstantiationException | IllegalAccessException | IllegalArgumentException | InvocationTargetException e) {
+            resultValue = new UnknownValue();
             if (log.isWarnEnabled()) {
-                log.warn("Failed to reflect " + methodDescriptor);
+                log.warn("Failed to reflect {}", methodDescriptor);
             }
 
             if (log.isDebugEnabled()) {
@@ -141,9 +143,10 @@ public class MethodReflector {
             }
         }
 
-        boolean returnsVoid = returnType.equals("V");
+        boolean returnsVoid = "V".equals(returnType);
         if (!returnsVoid) {
-            calleeContext.assignReturnRegister(result);
+            HeapItem resultItem = new HeapItem(resultValue, returnType);
+            calleeContext.assignReturnRegister(resultItem);
         }
     }
 
@@ -157,26 +160,18 @@ public class MethodReflector {
         int size = parameterTypes.size() - offset;
         Object[] args = new Object[size];
         for (int i = offset; i < mState.getRegisterCount(); i++) {
-            Object arg = mState.peekParameter(i);
-            String type = parameterTypes.get(i);
+            HeapItem argItem = mState.peekParameter(i);
+            Object arg = argItem.getValue();
+            String parameterType = parameterTypes.get(i);
             if (null != arg) {
-                // In Dalvik, integer is overloaded and may represent a few primitives.
-                if (Integer.class == arg.getClass()) {
-                    int intValue = (Integer) arg;
-                    if (type.equals("Z") || type.equals("Ljava/lang/Boolean;")) {
-                        arg = intValue == 0 ? false : true;
-                    } else if (type.equals("C") || type.equals("Ljava/lang/Character;")) {
-                        arg = (char) intValue;
-                    } else if (type.equals("S") || type.equals("Ljava/lang/Short;")) {
-                        arg = (short) intValue;
-                    } else if (type.equals("B") || type.equals("Ljava/lang/Byte;")) {
-                        arg = (byte) intValue;
-                    }
+                // In Dalvik, I type is overloaded and can represent multiple primitives, e.g. B, S, C
+                if (argItem.isPrimitiveOrWrapper()) {
+                    arg = Utils.castToPrimitiveWrapper(arg, parameterType);
                 }
             }
             args[i - offset] = arg;
 
-            if ("J".equals(type) || "D".equals(type)) {
+            if (Utils.getRegisterSize(parameterType) == 2) {
                 // Long tried every diet but is still fat and takes 2 registers. Could be thyroid.
                 i++;
             }
